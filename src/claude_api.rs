@@ -128,11 +128,11 @@ impl ClaudeClient {
         let manual_thinking_enabled = !config.thinking_adaptive && config.thinking_budget_tokens > 0;
 
         // When manual thinking is enabled, max_tokens must exceed budget_tokens.
-        // For adaptive mode, use a sensible default max_tokens.
+        // For adaptive mode, use 25000 as the default max_tokens.
         let max_tokens: u32 = if manual_thinking_enabled {
             config.thinking_budget_tokens + 4096
         } else {
-            4096
+            25000
         };
 
         let mut body = json!({

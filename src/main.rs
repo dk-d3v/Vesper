@@ -8,6 +8,10 @@
 //! Tokens are printed with `print!` + `stdout().flush()` as they arrive,
 //! giving the user a typewriter-style display.
 
+#![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+
 use std::io::{self, BufRead, Write};
 
 mod audit;
@@ -25,21 +29,37 @@ mod pipeline;
 mod types;
 mod verification;
 
-use config::load_config;
 use pipeline::Pipeline;
 
 #[tokio::main]
 async fn main() {
-    // Initialise structured logging — default level WARN to keep output clean.
+    // Initialise structured logging — suppress ort crate noise, default WARN elsewhere.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("ort=error".parse().unwrap())
                 .add_directive(tracing::Level::WARN.into()),
         )
         .init();
 
-    // Load configuration from .env / system environment.
-    let config = match load_config() {
+    // Determine directory containing this executable so resources are found
+    // regardless of the current working directory.
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+    // Load .env from exe directory first; fall back to cwd.
+    let env_path = exe_dir.join(".env");
+    if env_path.exists() {
+        dotenvy::from_path(&env_path).ok();
+    } else {
+        dotenvy::dotenv().ok();
+    }
+
+    // Load configuration from already-set environment variables.
+    use config::load_config_from_env;
+    let config = match load_config_from_env() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Configuration error: {}", e);

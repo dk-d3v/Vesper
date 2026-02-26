@@ -126,7 +126,7 @@ pub const CRITICAL_THRESHOLD: f64 = 0.8;
 pub const HALLUCINATION_THRESHOLD: f64 = 0.7;
 
 /// Maximum tokens allowed in a single Claude request.
-pub const MAX_TOKENS: usize = 4096;
+pub const MAX_TOKENS: usize = 25000;
 
 /// Maximum allowed length (characters) for user input.
 pub const MAX_INPUT_LENGTH: usize = 32_768;
@@ -148,3 +148,17 @@ pub const SKILL_TOP_K: usize = 5;
 
 /// Maximum number of conversation turns kept in the in-memory session buffer.
 pub const MAX_SESSION_TURNS: usize = 50;
+
+// ── Exe-relative path helpers ──────────────────────────────────────────────
+
+/// Returns the directory containing the running executable.
+///
+/// Falls back to `"."` if the path cannot be determined (e.g. in unit tests).
+/// Use this to resolve resource paths (`.env`, `models/`, `prompts/`) so the
+/// binary works correctly regardless of the current working directory.
+pub fn exe_dir() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+}

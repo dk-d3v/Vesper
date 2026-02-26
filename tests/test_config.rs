@@ -143,7 +143,7 @@ fn test_constants_have_expected_values() {
     assert_eq!(REFLEX_THRESHOLD, 0.3, "REFLEX_THRESHOLD should be 0.3");
     assert_eq!(CRITICAL_THRESHOLD, 0.8, "CRITICAL_THRESHOLD should be 0.8");
     assert_eq!(HALLUCINATION_THRESHOLD, 0.7, "HALLUCINATION_THRESHOLD should be 0.7");
-    assert_eq!(MAX_TOKENS, 4096, "MAX_TOKENS should be 4096");
+    assert_eq!(MAX_TOKENS, 25000, "MAX_TOKENS should be 25000");
     assert_eq!(MAX_INPUT_LENGTH, 32_768, "MAX_INPUT_LENGTH should be 32768");
     assert_eq!(MIN_RAG_RELEVANCE, 0.7, "MIN_RAG_RELEVANCE should be 0.7");
     assert_eq!(RAG_TOP_K, 5, "RAG_TOP_K should be 5");

@@ -3,6 +3,10 @@
 //! The binary (`main.rs`) and integration tests (`tests/`) both import from
 //! this crate root. Module declarations here mirror those in `main.rs`.
 
+#![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+
 pub mod audit;
 pub mod claude_api;
 pub mod coherence;

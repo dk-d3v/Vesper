@@ -44,9 +44,26 @@ impl OnnxEmbedding {
     /// On failure (missing file, runtime error, or feature disabled) falls back
     /// to the deterministic hash implementation and logs a warning.
     pub fn new(model_path: &str) -> Result<Self, AiAssistantError> {
+        // If the model path is relative, resolve it against the exe directory so
+        // the binary works correctly regardless of the current working directory.
+        let resolved_path: std::path::PathBuf = {
+            let p = std::path::Path::new(model_path);
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                crate::config::exe_dir().join(p)
+            }
+        };
+        let model_path_str = resolved_path
+            .to_str()
+            .unwrap_or(model_path);
+
+        // Keep original string for display; use resolved for loading.
+        let model_path_display = model_path.to_string();
+
         #[cfg(feature = "onnx")]
         {
-            match Self::try_load_onnx(model_path) {
+            match Self::try_load_onnx(model_path_str) {
                 Ok(session) => {
                     tracing::info!("ONNX model loaded from '{}'", model_path);
                     return Ok(Self {
@@ -73,7 +90,7 @@ impl OnnxEmbedding {
         );
 
         Ok(Self {
-            model_path: model_path.to_string(),
+            model_path: model_path_display,
             backend: EmbeddingBackend::Hash,
         })
     }
