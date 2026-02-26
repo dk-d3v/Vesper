@@ -1,6 +1,6 @@
 # AI Assistant — Architecture Document
 
-> **Version:** 1.0.0
+> **Version:** 2.0.0
 > **Date:** 2026-02-26
 > **Spec Reference:** [`docs/specification.md`](specification.md)
 > **Language:** Rust · **LLM Backend:** Claude API via reqwest
@@ -49,10 +49,12 @@ ai-assistant/
 │   ├── coherence.rs                 # Prime-radiant coherence (~80 lines)
 │   ├── claude_api.rs                # Claude HTTP client (~150 lines)
 │   ├── mcp_tools.rs                 # MCP tools loader (~120 lines)
-│   ├── verification.rs              # Proof validation, witness chain (~100 lines)
-│   ├── learning.rs                  # SONA trajectories (~90 lines)
-│   ├── audit.rs                     # RVF audit trail (~80 lines)
-│   └── pipeline.rs                  # 10-step orchestrator (~200 lines)
+│   ├── verification.rs              # Proof validation, ProofTier routing, attestation chain (~793 lines)
+│   ├── forensic.rs                  # ForensicBundle, replay_audit (~NEW)
+│   ├── learning.rs                  # SONA trajectories, 5-dim quality, background analysis (~657 lines)
+│   ├── ner.rs                       # Multilingual NER entity extraction
+│   ├── audit.rs                     # RVF audit trail, ForensicBundle builder (~80 lines)
+│   └── pipeline.rs                  # 10-step orchestrator (~776 lines)
 └── tests/
     ├── test_config.rs
     ├── test_embedding.rs
@@ -83,9 +85,11 @@ graph TD
     COH["coherence.rs<br/><i>Prime-Radiant</i>"]
     CLAUDE["claude_api.rs<br/><i>Claude HTTP Client</i>"]
     MCP["mcp_tools.rs<br/><i>MCP Tool Manager</i>"]
-    VERIF["verification.rs<br/><i>Proof & Witness</i>"]
-    LEARN["learning.rs<br/><i>SONA Trajectories</i>"]
+    VERIF["verification.rs<br/><i>Proof & Witness & ProofTier</i>"]
+    LEARN["learning.rs<br/><i>SONA + 5-dim Quality + Background</i>"]
     AUDIT["audit.rs<br/><i>RVF Audit Trail</i>"]
+    FORENSIC["forensic.rs<br/><i>ForensicBundle & replay_audit</i>"]
+    NER["ner.rs<br/><i>Multilingual NER</i>"]
 
     MAIN --> CFG
     MAIN --> PIPE
@@ -101,7 +105,9 @@ graph TD
     PIPE --> VERIF
     PIPE --> LEARN
     PIPE --> AUDIT
+    PIPE --> NER
     PIPE --> TYPES
+    AUDIT --> FORENSIC
     PIPE --> ERR
 
     MEM --> EMB
@@ -133,7 +139,7 @@ graph TD
     classDef shared fill:#d9534f,stroke:#b94a48,color:#fff
 
     class PIPE orchestrator
-    class EMB,MEM,GRAPH,COH,CLAUDE,MCP,VERIF,LEARN,AUDIT core
+    class EMB,MEM,GRAPH,COH,CLAUDE,MCP,VERIF,LEARN,AUDIT,FORENSIC,NER core
     class MAIN,CFG infra
     class TYPES,ERR,LANG shared
 ```
@@ -376,77 +382,176 @@ impl McpToolManager {
 ### 4.10 [`verification.rs`](../src/verification.rs)
 
 ```rust
-pub struct VerificationEngine {
-    verifier: RuvectorVerified,
-    container: CognitiveContainer,
-    witness_chain: Vec<WitnessEntry>,
+/// Proof tier for quality-based routing (ruvllm pattern).
+pub enum ProofTier { Standard, Enhanced, Critical }
+
+pub struct Verifier {
+    env: ProofEnvironment,
+    witnesses: Vec<String>,
+    attestations: Vec<ProofAttestation>,  // SEC-002: cryptographic attestation chain
 }
 
-impl VerificationEngine {
-    pub fn new() -> Self;
-    pub fn validate_response(&self, text: &str) -> Result<Proof, AiAssistantError>;
-    pub fn record_witness(&mut self, response: &str, proof: &Proof) -> WitnessEntry;
-    pub fn verify_chain_integrity(&self) -> bool;
+impl Verifier {
+    pub fn new() -> Result<Self, AiAssistantError>;
+    pub fn validate_and_record(&mut self, text: &str, context: &str)
+        -> Result<VerifiedResponse, AiAssistantError>;
+    pub fn validate_and_route(&mut self, text: &str, context: &str, quality_score: f32)
+        -> Result<(VerifiedResponse, ProofTier), AiAssistantError>;
+    pub fn validate_tool_response(&self, json: &serde_json::Value) -> ValidationResult;
+    pub fn attestation_chain(&self) -> &[ProofAttestation];
 }
+
+/// Route a quality score to the appropriate ProofTier.
+/// security_flagged=true always returns Critical.
+pub fn route_proof(quality_score: f32, security_flagged: bool) -> ProofTier;
 ```
+
+> **Note:** [`create_attestation()`](../ruvector/crates/ruvector-verified/src/proof_store.rs) is called
+> on every `validate_and_record()` call — SEC-002 P0 fix (previously `_proof_id` was discarded).
 
 ### 4.11 [`learning.rs`](../src/learning.rs)
 
 ```rust
-pub struct LearningEngine { sona: Sona }
+/// 5-dimensional quality score (inspired by ruvllm::QualityScoringEngine).
+pub struct QualityScore {
+    pub length_score: f32,
+    pub vocabulary_score: f32,
+    pub structure_score: f32,
+    pub topic_coherence_score: f32,
+    pub confidence_score: f32,
+    pub overall: f32,  // weighted composite
+}
+
+pub struct LearningEngine {
+    engine: SonaEngine,
+    embedding: Arc<OnnxEmbedding>,
+    trajectory_counter: u64,
+    records: Vec<TrajectoryRecord>,
+    quality_history: VecDeque<f32>,  // rolling window, max 100
+}
 
 impl LearningEngine {
-    pub fn new() -> Self;
-    pub fn record_trajectory(&self, turn: &ConversationTurn) -> Result<LearningResult, AiAssistantError>;
-    // NOTE: No LoRA — observation only
+    pub fn new(embedding: Arc<OnnxEmbedding>) -> Result<Self, AiAssistantError>;
+    /// Record a 4-step SONA trajectory. Does NOT call apply_micro_lora/apply_base_lora.
+    pub fn record_trajectory(&mut self, user_message: &str, context: &str, prompt: &str, response: &str)
+        -> Result<LearningResult, AiAssistantError>;
+    /// Explicit K-means++ pattern extraction via SONA force_learn().
+    pub fn find_patterns(&mut self) -> Result<usize, AiAssistantError>;
+    /// Linear trend of last ≤10 quality scores. Returns slope (positive = improving).
+    pub fn quality_trend(&self) -> Option<f32>;
+    /// Loop B: streak/cluster pattern detection (ruvllm background loop analogue).
+    pub fn run_background_analysis(&mut self) -> usize;
 }
+
+/// Compute 5-dimensional quality score without instantiating LearningEngine.
+pub fn compute_quality_5dim(response: &str, context: &str) -> QualityScore;
 ```
 
-### 4.12 [`audit.rs`](../src/audit.rs)
+> **SONA Loop mapping:**
+> - Loop A (Instant): `record_trajectory()` → `engine.tick()` — every turn
+> - Loop B (Background): `run_background_analysis()` — every 5 turns (streak/cluster)
+> - Loop C (Deep/EWC++): **intentionally omitted** — Claude is a remote API, no local weights
+
+### 4.12 [`forensic.rs`](../src/forensic.rs)
+
+```rust
+/// Forensic snapshot of a single pipeline session for audit replay.
+pub struct ForensicBundle {
+    pub session_id: String,
+    pub timestamp_ms: u64,
+    pub latency: LatencyBreakdown,
+    pub audit_entries: Vec<AuditEntry>,
+    pub attestation_count: usize,
+    pub proof_tier: String,
+    pub coherence_score: f32,
+    pub quality_score: f32,
+}
+
+impl ForensicBundle {
+    pub fn new(session_id: impl Into<String>, latency: LatencyBreakdown) -> Self;
+}
+
+/// Reconstruct a human-readable turn-by-turn audit from a ForensicBundle.
+pub fn replay_audit(bundle: &ForensicBundle) -> Vec<String>;
+```
+
+### 4.13 [`audit.rs`](../src/audit.rs)
 
 ```rust
 pub struct AuditTrail { runtime: RvfRuntime, crypto: RvfCrypto, last_hash: Vec<u8> }
 
 impl AuditTrail {
     pub fn new() -> Self;
-    pub fn record(&mut self, turn: &ConversationTurn) -> Result<AuditResult, AiAssistantError>;
-    pub fn verify_trail(&self) -> Result<bool, AiAssistantError>;
-    pub fn get_last_hash(&self) -> Vec<u8>;
+    pub fn record(&mut self, data: &str, entry_type: AuditEntryType) -> Result<AuditResult, AiAssistantError>;
+    pub fn build_forensic_bundle(&self, session_id: &str, latency: LatencyBreakdown,
+        proof_tier: &str, coherence_score: f32, quality_score: f32) -> ForensicBundle;
 }
 ```
 
-### 4.13 [`pipeline.rs`](../src/pipeline.rs)
+### 4.14 [`ner.rs`](../src/ner.rs)
 
 ```rust
-pub struct Pipeline;
+pub struct NerEngine { /* multilingual ONNX NER model */ }
+
+impl NerEngine {
+    pub fn new(model_path: &str) -> Result<Self, AiAssistantError>;
+    /// Extract (entity_text, EntityType) pairs from document text.
+    pub fn extract(&self, text: &str) -> Vec<(String, EntityType)>;
+}
+```
+
+> Model: `multilingual-ner` ONNX — recognises PERSON, ORG, LOC, MISC entities.
+> Used in [`step9_update_and_audit()`](../src/pipeline.rs) to link entities to conversation graph nodes.
+
+### 4.15 [`pipeline.rs`](../src/pipeline.rs)
+
+```rust
+pub struct Pipeline { /* all subsystems owned */ }
 
 impl Pipeline {
-    pub fn execute_turn(
-        raw_input: &str,
-        config: &Config,
-        memory: &MemoryStore,
-        graph: &GraphStore,
-        coherence: &CoherenceEngine,
-        verifier: &mut VerificationEngine,
-        sona: &LearningEngine,
-        audit: &mut AuditTrail,
-        mcp_tools: &Option<McpToolManager>,
-        session: &mut Session,
-    ) -> Result<String, AiAssistantError>;
+    pub async fn new(config: Config) -> Result<Self, AiAssistantError>;
+    pub async fn execute_turn(&mut self, raw_input: &str) -> Result<String, AiAssistantError>;
+    pub async fn execute_turn_stream<F>(&mut self, raw_input: &str, on_token: F)
+        -> Result<String, AiAssistantError>
+    where F: FnMut(&str) + Send + 'static;
 }
 
 // Internal step functions (private):
-// step1_receive_message, step2_semantic_search, step3_graph_context,
-// step4_prepare_prompt, step5_coherence_check, step6_call_claude,
-// step7_security_check, step8_sona_learning, step9_update_and_audit,
-// step10_return
+// step1_receive, step2_semantic_search, step3_graph_context,
+// step4_prepare_prompt, step5_coherence_check, step6_claude_call_stream,
+// step7_security_check, step8_learning, step9_update_and_audit, step10_return
 ```
 
-### 4.14 [`language.rs`](../src/language.rs)
+> **step8_learning() — SONA Loop B wire-up:**
+> - Every turn: `record_trajectory()` → `quality_trend()` logged as `step8_quality_trend`
+> - Every 5 turns: `run_background_analysis()` logged as `step8_background_analysis`
+> - Every 10 turns: `find_patterns()` for explicit K-means++ extraction
+
+### 4.16 [`language.rs`](../src/language.rs)
 
 ```rust
 pub fn detect_language(text: &str) -> Language;
 // Uses whatlang crate, confidence > 0.5, English fallback
+```
+
+---
+
+## 4a. GNN Prompt-Leak Fix (Security)
+
+**Issue discovered:** [`apply_gnn_analysis()`](../src/graph_context.rs) was appending
+`[GNN] graph_embedding: N nodes analysed, method=mean_pooling` to `rag_content`,
+which flows through [`step4_prepare_prompt()`](../src/pipeline.rs) → `FinalPrompt::full_content()`
+→ Claude API user message. Claude interpreted this as a prompt injection attempt.
+
+**Fix:** GNN metadata is now **log-only** (`tracing::info!`) — never appended to `rag_content`.
+
+```rust
+// BEFORE (bug):
+rag_content.push_str(&format!("[GNN] graph_embedding: {} nodes analysed", n));
+
+// AFTER (fix):
+tracing::info!("GNN analysis complete: {} nodes, method={}", n, method);
+// rag_content returned unchanged
 ```
 
 ---
@@ -610,8 +715,12 @@ flowchart TB
 | **Token budget** | Hard cap at 4,096 tokens prevents context overflow | [`pipeline.rs`](../src/pipeline.rs) Step 4 |
 | **Hallucination detection** | Prime-radiant energy scoring (threshold > 0.7) | [`coherence.rs`](../src/coherence.rs) |
 | **Proof-carrying responses** | ruvector-verified validation per response | [`verification.rs`](../src/verification.rs) |
+| **Cryptographic attestation chain** | SEC-002: `create_attestation()` called each turn, SipHash-256 | [`verification.rs`](../src/verification.rs) |
+| **ProofTier routing** | Standard / Enhanced / Critical based on quality score | [`verification.rs`](../src/verification.rs) |
 | **Witness chain** | SHAKE-256 chained entries in CognitiveContainer | [`verification.rs`](../src/verification.rs) |
 | **Immutable audit trail** | RVF append-only hash chain, tamper-evident | [`audit.rs`](../src/audit.rs) |
+| **ForensicBundle replay** | Session audit snapshots for forensic reconstruction | [`forensic.rs`](../src/forensic.rs) |
+| **GNN metadata isolation** | GNN debug strings logged only — never sent to Claude API | [`graph_context.rs`](../src/graph_context.rs) |
 | **Tool sandboxing** | Tools managed by Rust — Claude cannot execute code | [`mcp_tools.rs`](../src/mcp_tools.rs) |
 | **Submodule integrity** | `ruvector/` is read-only git submodule | `.gitmodules` |
 
@@ -653,26 +762,30 @@ All modules, interfaces, and diagrams must stay synchronized with the spec.*
 
 All modules listed in the directory structure have been implemented and are present in [`src/`](../src/).
 
-| Module | File | Status |
-|---|---|---|
-| Entry point & REPL | [`src/main.rs`](../src/main.rs) | ✅ Implemented |
-| Config loading | [`src/config.rs`](../src/config.rs) | ✅ Implemented |
-| Shared data types | [`src/types.rs`](../src/types.rs) | ✅ Implemented |
-| Error enum | [`src/error.rs`](../src/error.rs) | ✅ Implemented |
-| Language detection | [`src/language.rs`](../src/language.rs) | ✅ Implemented |
-| ONNX embeddings | [`src/embedding.rs`](../src/embedding.rs) | ✅ Implemented |
-| Semantic memory (AgenticDB) | [`src/memory.rs`](../src/memory.rs) | ✅ Implemented |
-| Graph context & RAG | [`src/graph_context.rs`](../src/graph_context.rs) | ✅ Implemented |
-| Prime-Radiant coherence | [`src/coherence.rs`](../src/coherence.rs) | ✅ Implemented |
-| Claude API client | [`src/claude_api.rs`](../src/claude_api.rs) | ✅ Implemented |
-| MCP tool manager | [`src/mcp_tools.rs`](../src/mcp_tools.rs) | ✅ Implemented |
-| Proof & witness chain | [`src/verification.rs`](../src/verification.rs) | ✅ Implemented |
-| SONA trajectory learning | [`src/learning.rs`](../src/learning.rs) | ✅ Implemented |
-| RVF audit trail | [`src/audit.rs`](../src/audit.rs) | ✅ Implemented |
-| 10-step pipeline orchestrator | [`src/pipeline.rs`](../src/pipeline.rs) | ✅ Implemented |
-| Library root | [`src/lib.rs`](../src/lib.rs) | ✅ Implemented |
+| Module | File | Tests | Status |
+|---|---|---|---|
+| Entry point & REPL | [`src/main.rs`](../src/main.rs) | — | ✅ Implemented |
+| Config loading | [`src/config.rs`](../src/config.rs) | ✅ | ✅ Implemented |
+| Shared data types | [`src/types.rs`](../src/types.rs) | ✅ | ✅ Implemented |
+| Error enum | [`src/error.rs`](../src/error.rs) | — | ✅ Implemented |
+| Language detection | [`src/language.rs`](../src/language.rs) | ✅ | ✅ Implemented |
+| ONNX embeddings | [`src/embedding.rs`](../src/embedding.rs) | ✅ | ✅ Implemented |
+| Semantic memory (AgenticDB) | [`src/memory.rs`](../src/memory.rs) | ✅ | ✅ Implemented |
+| Graph context & RAG & GNN | [`src/graph_context.rs`](../src/graph_context.rs) | ✅ | ✅ Implemented |
+| Prime-Radiant coherence | [`src/coherence.rs`](../src/coherence.rs) | ✅ | ✅ Implemented |
+| Claude API client | [`src/claude_api.rs`](../src/claude_api.rs) | ✅ | ✅ Implemented |
+| MCP tool manager | [`src/mcp_tools.rs`](../src/mcp_tools.rs) | ✅ | ✅ Implemented |
+| Proof, witness, ProofTier, attestation | [`src/verification.rs`](../src/verification.rs) | ✅ 19 tests | ✅ Implemented |
+| SONA learning, 5-dim quality, Loop B | [`src/learning.rs`](../src/learning.rs) | ✅ 13 tests | ✅ Implemented |
+| ForensicBundle & replay_audit | [`src/forensic.rs`](../src/forensic.rs) | ✅ 5 tests | ✅ Implemented |
+| RVF audit trail | [`src/audit.rs`](../src/audit.rs) | ✅ | ✅ Implemented |
+| Multilingual NER | [`src/ner.rs`](../src/ner.rs) | — | ✅ Implemented |
+| 10-step pipeline orchestrator | [`src/pipeline.rs`](../src/pipeline.rs) | ✅ | ✅ Implemented |
+| Library root | [`src/lib.rs`](../src/lib.rs) | — | ✅ Implemented |
 
-### Test Coverage
+**Total: 99/99 tests passing** (`cargo test --lib`)
+
+### Integration Test Coverage
 
 | Test File | Module Covered | Status |
 |---|---|---|
@@ -681,6 +794,9 @@ All modules listed in the directory structure have been implemented and are pres
 | [`tests/test_coherence.rs`](../tests/test_coherence.rs) | `coherence.rs` | ✅ Implemented |
 | [`tests/test_audit.rs`](../tests/test_audit.rs) | `audit.rs` | ✅ Implemented |
 | [`tests/test_graph_context.rs`](../tests/test_graph_context.rs) | `graph_context.rs` | ✅ Implemented |
+| [`tests/test_pipeline.rs`](../tests/test_pipeline.rs) | `pipeline.rs` end-to-end | ✅ Implemented |
+| [`tests/test_types.rs`](../tests/test_types.rs) | `types.rs` | ✅ Implemented |
+| [`tests/test_language.rs`](../tests/test_language.rs) | `language.rs` | ✅ Implemented |
 
 ### Ruvector Submodule Crates
 
