@@ -4,8 +4,9 @@
 //! default multi-threaded test harness (`cargo test`).
 
 use ai_assistant::config::{
-    load_config, CRITICAL_THRESHOLD, HALLUCINATION_THRESHOLD, MAX_INPUT_LENGTH, MAX_TOKENS,
-    MEMORY_TOP_K, MIN_RAG_RELEVANCE, RAG_MAX_HOPS, RAG_TOP_K, REFLEX_THRESHOLD, SKILL_TOP_K,
+    load_config, load_config_from_env, CRITICAL_THRESHOLD, HALLUCINATION_THRESHOLD,
+    MAX_INPUT_LENGTH, MAX_TOKENS, MEMORY_TOP_K, MIN_RAG_RELEVANCE, RAG_MAX_HOPS, RAG_TOP_K,
+    REFLEX_THRESHOLD, SKILL_TOP_K,
 };
 use std::sync::{Mutex, MutexGuard};
 
@@ -56,7 +57,9 @@ fn test_load_config_fails_missing_api_key() {
     let _g = EnvGuard::remove("ANTHROPIC_API_KEY");
     let _g2 = EnvGuard::set("ANTHROPIC_BASE_URL", "https://api.anthropic.com");
 
-    let result = load_config();
+    // Use load_config_from_env so dotenv() doesn't re-inject .env values
+    // after our EnvGuard::remove() call.
+    let result = load_config_from_env();
     assert!(result.is_err(), "Expected error with missing API key");
     let msg = result.unwrap_err().to_string();
     assert!(
@@ -120,7 +123,9 @@ fn test_load_config_defaults_for_optional_vars() {
     let _model = EnvGuard::remove("CLAUDE_MODEL");
     let _emb = EnvGuard::remove("EMBEDDING_MODEL_PATH");
 
-    let result = load_config();
+    // Use load_config_from_env so dotenv() doesn't re-inject .env values
+    // after our EnvGuard::remove() calls.
+    let result = load_config_from_env();
     assert!(result.is_ok(), "Expected Ok with defaults, got: {:?}", result.err());
 
     let cfg = result.unwrap();

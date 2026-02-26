@@ -16,14 +16,14 @@ pub struct Config {
     pub embedding_model_path: String,
 }
 
-/// Load configuration from the environment (`.env` + system env vars).
+/// Load configuration purely from already-set environment variables.
+///
+/// Does **not** call `dotenvy::dotenv()` — useful in tests that need to
+/// control the env precisely via [`std::env::set_var`] / [`std::env::remove_var`].
 ///
 /// # Errors
 /// Returns [`AiAssistantError::Config`] if required variables are missing or invalid.
-pub fn load_config() -> Result<Config, AiAssistantError> {
-    // Load .env if present; ignore the error — variables may already be set externally.
-    let _ = dotenvy::dotenv();
-
+pub fn load_config_from_env() -> Result<Config, AiAssistantError> {
     let api_key = std::env::var("ANTHROPIC_API_KEY")
         .map_err(|_| AiAssistantError::Config("ANTHROPIC_API_KEY not set".to_string()))?;
 
@@ -66,6 +66,19 @@ pub fn load_config() -> Result<Config, AiAssistantError> {
         claude_model,
         embedding_model_path,
     })
+}
+
+/// Load configuration from the environment (`.env` + system env vars).
+///
+/// Loads `.env` via `dotenvy` first (ignoring errors if the file is absent),
+/// then delegates to [`load_config_from_env`].
+///
+/// # Errors
+/// Returns [`AiAssistantError::Config`] if required variables are missing or invalid.
+pub fn load_config() -> Result<Config, AiAssistantError> {
+    // Load .env if present; ignore the error — variables may already be set externally.
+    let _ = dotenvy::dotenv();
+    load_config_from_env()
 }
 
 // ── Pipeline thresholds ────────────────────────────────────────────────────

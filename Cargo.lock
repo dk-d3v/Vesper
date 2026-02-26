@@ -19,7 +19,7 @@ dependencies = [
  "dotenvy",
  "futures-util",
  "hex",
- "ndarray 0.16.1",
+ "ndarray 0.17.2",
  "ort",
  "prime-radiant",
  "reqwest",

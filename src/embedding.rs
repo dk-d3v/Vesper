@@ -18,8 +18,9 @@ enum EmbeddingBackend {
     /// Deterministic hash-based fallback — correct dimensions, no semantics.
     Hash,
     /// Real ONNX inference via `ort`.
+    /// Session::run() requires &mut self, so we wrap in Mutex for interior mutability.
     #[cfg(feature = "onnx")]
-    Onnx(std::sync::Arc<ort::Session>),
+    Onnx(std::sync::Arc<std::sync::Mutex<ort::session::Session>>),
 }
 
 // ── Public struct ────────────────────────────────────────────────────────────
@@ -32,7 +33,7 @@ pub struct OnnxEmbedding {
     backend: EmbeddingBackend,
 }
 
-// Safety: ort::Session is Send + Sync in ort 2.x; Hash variant is trivially so.
+// Safety: Mutex<Session> is Send+Sync; Hash variant is trivially so.
 unsafe impl Send for OnnxEmbedding {}
 unsafe impl Sync for OnnxEmbedding {}
 
@@ -50,7 +51,9 @@ impl OnnxEmbedding {
                     tracing::info!("ONNX model loaded from '{}'", model_path);
                     return Ok(Self {
                         model_path: model_path.to_string(),
-                        backend: EmbeddingBackend::Onnx(std::sync::Arc::new(session)),
+                        backend: EmbeddingBackend::Onnx(std::sync::Arc::new(
+                            std::sync::Mutex::new(session),
+                        )),
                     });
                 }
                 Err(e) => {
@@ -110,22 +113,35 @@ impl OnnxEmbedding {
     // ── ONNX inference (feature-gated) ───────────────────────────────────────
 
     #[cfg(feature = "onnx")]
-    fn try_load_onnx(model_path: &str) -> Result<ort::Session, AiAssistantError> {
-        if !std::path::Path::new(model_path).exists() {
+    fn try_load_onnx(model_path: &str) -> Result<ort::session::Session, AiAssistantError> {
+        // model_path may be either:
+        //   (a) the full path to the .onnx file, or
+        //   (b) a model directory — in which case the canonical sub-path
+        //       "<model_path>/onnx/model.onnx" is tried automatically.
+        let resolved = {
+            let p = std::path::Path::new(model_path);
+            if p.is_dir() {
+                p.join("onnx").join("model.onnx")
+            } else {
+                p.to_path_buf()
+            }
+        };
+
+        if !resolved.exists() {
             return Err(AiAssistantError::Embedding(format!(
                 "ONNX model file not found: {}",
-                model_path
+                resolved.display()
             )));
         }
-        ort::Session::builder()
+        ort::session::Session::builder()
             .map_err(|e| AiAssistantError::Embedding(format!("ort builder: {e}")))?
-            .commit_from_file(model_path)
+            .commit_from_file(&resolved)
             .map_err(|e| AiAssistantError::Embedding(format!("ort load: {e}")))
     }
 
     #[cfg(feature = "onnx")]
     fn onnx_embed(
-        session: &std::sync::Arc<ort::Session>,
+        session: &std::sync::Arc<std::sync::Mutex<ort::session::Session>>,
         text: &str,
     ) -> Result<Vec<f32>, AiAssistantError> {
         use ndarray::Array2;
@@ -134,30 +150,40 @@ impl OnnxEmbedding {
         let seq_len = input_ids.len();
         let token_type_ids = vec![0i64; seq_len];
 
-        let ids = Array2::from_shape_vec((1, seq_len), input_ids)
+        // Build ndarray Array2 tensors
+        let ids_arr = Array2::from_shape_vec((1, seq_len), input_ids)
             .map_err(|e| AiAssistantError::Embedding(e.to_string()))?;
-        let mask = Array2::from_shape_vec((1, seq_len), attention_mask.clone())
+        let mask_arr = Array2::from_shape_vec((1, seq_len), attention_mask.clone())
             .map_err(|e| AiAssistantError::Embedding(e.to_string()))?;
-        let types = Array2::from_shape_vec((1, seq_len), token_type_ids)
-            .map_err(|e| AiAssistantError::Embedding(e.to_string()))?;
-
-        let outputs = session
-            .run(
-                ort::inputs![
-                    "input_ids"      => ids.view(),
-                    "attention_mask" => mask.view(),
-                    "token_type_ids" => types.view()
-                ]
-                .map_err(|e| AiAssistantError::Embedding(e.to_string()))?,
-            )
+        let types_arr = Array2::from_shape_vec((1, seq_len), token_type_ids)
             .map_err(|e| AiAssistantError::Embedding(e.to_string()))?;
 
-        // last_hidden_state: [1, seq_len, 384]
-        let tensor = outputs["last_hidden_state"]
+        // ort 2.0.0-rc.11: Tensor lives in ort::value module
+        let ids_val = ort::value::Tensor::from_array(ids_arr)
+            .map_err(|e: ort::Error| AiAssistantError::Embedding(e.to_string()))?;
+        let mask_val = ort::value::Tensor::from_array(mask_arr)
+            .map_err(|e: ort::Error| AiAssistantError::Embedding(e.to_string()))?;
+        let types_val = ort::value::Tensor::from_array(types_arr)
+            .map_err(|e: ort::Error| AiAssistantError::Embedding(e.to_string()))?;
+
+        // Lock the mutex to get &mut Session — Session::run() requires &mut self
+        let mut guard = session
+            .lock()
+            .map_err(|_| AiAssistantError::Embedding("Session mutex poisoned".to_string()))?;
+        let outputs = guard
+            .run(ort::inputs![
+                "input_ids"      => ids_val,
+                "attention_mask" => mask_val,
+                "token_type_ids" => types_val
+            ])
+            .map_err(|e| AiAssistantError::Embedding(e.to_string()))?;
+
+        // try_extract_tensor returns (&Shape, &[T]) — .1 is the raw float slice
+        let (_shape, data) = outputs["last_hidden_state"]
             .try_extract_tensor::<f32>()
-            .map_err(|e| AiAssistantError::Embedding(e.to_string()))?;
+            .map_err(|e: ort::Error| AiAssistantError::Embedding(e.to_string()))?;
 
-        let flat: Vec<f32> = tensor.view().iter().copied().collect();
+        let flat: Vec<f32> = data.to_vec();
 
         // Reshape to Vec<Vec<f32>> of shape [seq_len][384]
         let mut token_embs: Vec<Vec<f32>> = Vec::with_capacity(seq_len);

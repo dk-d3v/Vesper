@@ -6,7 +6,7 @@
 //! Tests that do NOT require a real API key test input validation,
 //! language detection, and configuration error handling.
 
-use ai_assistant::config::load_config;
+use ai_assistant::config::{load_config, load_config_from_env};
 use ai_assistant::error::AiAssistantError;
 use ai_assistant::language::detect_language;
 use ai_assistant::types::Language;
@@ -44,11 +44,12 @@ impl Drop for EnvGuard {
 // ── Test 1: Pipeline cannot be constructed without valid config ───────────────
 
 /// Test 1: Pipeline cannot be constructed without valid config.
-/// Config missing ANTHROPIC_API_KEY → load_config() returns error.
+/// Config missing ANTHROPIC_API_KEY → load_config_from_env() returns error.
+/// Uses load_config_from_env to avoid dotenv() re-injecting .env values.
 #[test]
 fn test_pipeline_requires_valid_config() {
     let _g = EnvGuard::remove("ANTHROPIC_API_KEY");
-    let result = load_config();
+    let result = load_config_from_env();
     assert!(
         result.is_err(),
         "load_config() should fail without ANTHROPIC_API_KEY"
