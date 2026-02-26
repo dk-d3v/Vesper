@@ -59,7 +59,7 @@ impl Pipeline {
         let mcp_path = crate::config::exe_dir().join("mcp_servers.json");
         let mcp = McpToolManager::load(mcp_path.to_str().unwrap_or("mcp_servers.json"))?;
         let verifier = Verifier::new()?;
-        let learning = LearningEngine::new()?;
+        let learning = LearningEngine::new(Arc::clone(&embedding))?;
         let audit = AuditTrail::new();
         let session = Session::new();
 

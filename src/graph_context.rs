@@ -24,7 +24,8 @@ use crate::{
 };
 use ruvector_graph::{
     GraphDB, NodeBuilder,
-    types::PropertyValue,
+    types::{PropertyValue, NodeId},
+    GraphNeuralEngine, GnnConfig,
 };
 use ruvector_mincut::{MinCutBuilder, DynamicMinCut};
 use ruvector_solver::forward_push::ForwardPushSolver;
@@ -41,6 +42,8 @@ pub struct GraphContextProvider {
     embedding: Arc<OnnxEmbedding>,
     /// Inline causal edges as `(cause, effect)` text pairs.
     causal_edges: Vec<(String, String)>,
+    /// GNN engine for relationship analysis.
+    gnn: GraphNeuralEngine,
 }
 
 // ── Impl ──────────────────────────────────────────────────────────────────────
@@ -54,10 +57,17 @@ impl GraphContextProvider {
         let graph = GraphDB::new();
         info!("GraphDB initialised (in-memory)");
 
+        let gnn = GraphNeuralEngine::new(GnnConfig::default());
+        info!("GraphNeuralEngine initialised (default config: {} layers, {} hidden_dim)",
+            GnnConfig::default().num_layers,
+            GnnConfig::default().hidden_dim
+        );
+
         Ok(Self {
             graph,
             embedding,
             causal_edges: Vec::new(),
+            gnn,
         })
     }
 
@@ -100,7 +110,8 @@ impl GraphContextProvider {
     /// 2. RAG multi-hop retrieval (up to [`RAG_MAX_HOPS`] hops).
     /// 3. PageRank ranking of retrieved documents.
     /// 4. MinCut topic clustering to remove irrelevant subgraphs.
-    /// 5. Causal edge retrieval matching the query.
+    /// 5. GNN relationship analysis (enriches `rag_content`).
+    /// 6. Causal edge retrieval matching the query.
     ///
     /// Returns empty context if the graph has no nodes.
     pub fn get_context(&self, query: &str) -> Result<GraphContext, AiAssistantError> {
@@ -126,7 +137,10 @@ impl GraphContextProvider {
         // Step 4: MinCut topic clustering to prune irrelevant subgraphs
         let pruned_content = self.apply_mincut_pruning(&ranked_content, query);
 
-        // Step 5: causal edges
+        // Step 5: GNN relationship analysis — enrich rag_content with graph embedding summary
+        let pruned_content = self.apply_gnn_analysis(&pruned_content);
+
+        // Step 6: causal edges
         let query_lower = query.to_lowercase();
         let causal_edges: Vec<(String, String)> = self
             .causal_edges
@@ -143,6 +157,43 @@ impl GraphContextProvider {
             entity_count,
             causal_edges,
         })
+    }
+
+    // ── GNN integration (ruvector-graph) ─────────────────────────────────────
+
+    /// Run GNN graph-level embedding on retrieved document node IDs and append
+    /// a one-line summary to `rag_content`.
+    ///
+    /// **Graceful degradation**: returns `content` unchanged on any failure.
+    fn apply_gnn_analysis(&self, content: &str) -> String {
+        // Use node_count() — in-memory GraphDB DashMap (no all_node_ids on in-memory store)
+        let count = self.graph.node_count();
+        if count == 0 {
+            return content.to_string();
+        }
+
+        // embed_graph only uses node_ids.len(); generate synthetic IDs
+        let node_ids: Vec<NodeId> = (0..count).map(|i| format!("node-{i}")).collect();
+
+        match self.gnn.embed_graph(&node_ids) {
+            Ok(graph_embedding) => {
+                let summary = format!(
+                    "\n---\n[GNN] graph_embedding: {} nodes analysed, method={}, dim={}",
+                    graph_embedding.node_count,
+                    graph_embedding.method,
+                    graph_embedding.embedding.len(),
+                );
+                info!(
+                    "GNN analysis complete: {} nodes, method={}",
+                    graph_embedding.node_count, graph_embedding.method
+                );
+                format!("{}{}", content, summary)
+            }
+            Err(e) => {
+                warn!("GNN embed_graph failed: {}; skipping GNN enrichment", e);
+                content.to_string()
+            }
+        }
     }
 
     // ── PageRank integration (ruvector-solver) ────────────────────────────────

@@ -7,8 +7,9 @@
 
 use ruvector_sona::{SonaEngine, TrajectoryBuilder};
 use ruvector_sona::engine::SonaEngineBuilder;
+use std::sync::Arc;
 
-use crate::{error::AiAssistantError, types::LearningResult};
+use crate::{embedding::OnnxEmbedding, error::AiAssistantError, types::LearningResult};
 
 /// Minimum response length (chars) before quality scoring ramps up.
 const QUALITY_MIN_LENGTH: usize = 50;
@@ -40,8 +41,10 @@ struct TrajectoryRecord {
 /// pattern extraction. LoRA weight-update methods are deliberately never
 /// called — Claude is a remote API, not a local model.
 pub struct LearningEngine {
-    /// SONA engine (hidden_dim = 256 for text embedding proxies).
+    /// SONA engine (hidden_dim = 256 for ONNX embedding vectors).
     engine: SonaEngine,
+    /// ONNX embedding provider shared with the rest of the pipeline.
+    embedding: Arc<OnnxEmbedding>,
     /// Trajectory counter (used to generate unique IDs).
     trajectory_counter: u64,
     /// Fallback in-memory store (populated alongside SONA).
@@ -49,8 +52,11 @@ pub struct LearningEngine {
 }
 
 impl LearningEngine {
-    /// Create a new learning engine with default SONA configuration.
-    pub fn new() -> Result<Self, AiAssistantError> {
+    /// Create a new learning engine.
+    ///
+    /// `embedding` is the shared [`OnnxEmbedding`] instance (real ONNX
+    /// inference when the model is loaded, hash fallback otherwise).
+    pub fn new(embedding: Arc<OnnxEmbedding>) -> Result<Self, AiAssistantError> {
         let engine = SonaEngineBuilder::new()
             .hidden_dim(256)
             .micro_lora_rank(2)
@@ -61,6 +67,7 @@ impl LearningEngine {
 
         Ok(Self {
             engine,
+            embedding,
             trajectory_counter: 0,
             records: Vec::new(),
         })
@@ -87,29 +94,32 @@ impl LearningEngine {
 
         let quality = Self::compute_quality(response, user_message);
 
-        // Build query embedding from user message bytes (proxy)
-        let query_embedding = text_to_embedding(user_message, 256);
+        // Build query embedding using real ONNX inference (hash fallback if unavailable)
+        let query_embedding = self
+            .embedding
+            .embed(user_message)
+            .unwrap_or_else(|_| vec![0.0; 256]);
 
         let mut builder: TrajectoryBuilder =
             self.engine.begin_trajectory(query_embedding);
 
         // Step 1 — context retrieval
         builder.add_step(
-            text_to_embedding(context, 256),
+            self.embedding.embed(context).unwrap_or_else(|_| vec![0.0; 256]),
             vec![],
             quality * 0.8,
         );
 
         // Step 2 — prompt assembly
         builder.add_step(
-            text_to_embedding(prompt, 256),
+            self.embedding.embed(prompt).unwrap_or_else(|_| vec![0.0; 256]),
             vec![],
             quality * 0.9,
         );
 
         // Step 3 — response generation (highest reward)
         builder.add_step(
-            text_to_embedding(response, 256),
+            self.embedding.embed(response).unwrap_or_else(|_| vec![0.0; 256]),
             vec![],
             quality,
         );

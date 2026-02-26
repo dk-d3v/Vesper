@@ -26,6 +26,13 @@ use ruvector_cognitive_container::{
     CoherenceDecision, ContainerWitnessReceipt, VerificationResult, WitnessChain,
 };
 
+// RVF cryptographic audit trail integration
+use rvf_crypto::{
+    shake256_256 as rvf_shake256,
+    create_witness_chain as rvf_create_witness_chain,
+    WitnessEntry,
+};
+
 use crate::{error::AiAssistantError, types::AuditResult};
 
 /// Sentinel hash used as the `prev_hash` of the very first entry.
@@ -90,9 +97,14 @@ const WITNESS_MAX_RECEIPTS: usize = 4096;
 /// `record()` call.  The witness layer is best-effort: if it panics the
 /// SHAKE-256 chain continues unaffected.
 ///
+/// A tertiary RVF crypto witness chain (`rvf_crypto::create_witness_chain`)
+/// encodes each audit entry into the RVF binary format for cross-system
+/// interoperability.
+///
 /// ```text
 /// [genesis] ← [entry 0] ← [entry 1] ← … ← [entry N]
-///              receipt 0     receipt 1         receipt N
+///              receipt 0     receipt 1         receipt N   (cognitive)
+///              rvf_entry 0   rvf_entry 1       rvf_entry N (rvf-crypto)
 /// ```
 pub struct AuditTrail {
     /// Ordered chain of audit entries (append-only).
@@ -101,6 +113,8 @@ pub struct AuditTrail {
     last_hash: String,
     /// Parallel witness chain producing per-epoch receipts.
     witness_chain: WitnessChain,
+    /// Accumulated RVF witness entries for cross-system audit export.
+    rvf_witness_entries: Vec<WitnessEntry>,
 }
 
 impl AuditTrail {
@@ -110,6 +124,7 @@ impl AuditTrail {
             entries: Vec::new(),
             last_hash: GENESIS_HASH.to_string(),
             witness_chain: WitnessChain::new(WITNESS_MAX_RECEIPTS),
+            rvf_witness_entries: Vec::new(),
         }
     }
 
@@ -148,6 +163,21 @@ impl AuditTrail {
 
         // ── Witness receipt (best-effort) ────────────────────────────────
         self.try_generate_witness_receipt(data, &entry_hash);
+
+        // ── RVF crypto witness entry ─────────────────────────────────────
+        // Record audit entry in RVF binary witness format for cross-system
+        // interoperability. Uses rvf_crypto::shake256_256 to hash the action.
+        let action_hash = rvf_shake256(entry_hash.as_bytes());
+        let timestamp_ns = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        self.rvf_witness_entries.push(WitnessEntry {
+            prev_hash: [0u8; 32], // will be re-linked by create_witness_chain
+            action_hash,
+            timestamp_ns,
+            witness_type: 0x01, // PROVENANCE type
+        });
 
         Ok(AuditResult {
             episode_id: id,
@@ -236,6 +266,22 @@ impl AuditTrail {
     /// hash arbitrary data consistently with the audit chain.
     pub fn shake256(data: &[u8]) -> String {
         shake256_hex(data)
+    }
+
+    /// Serialize the accumulated RVF witness entries into a binary chain.
+    ///
+    /// Uses [`rvf_crypto::create_witness_chain`] to link entries by hash.
+    /// Returns the resulting byte vector; an empty chain returns `Vec::new()`.
+    pub fn rvf_witness_bytes(&self) -> Vec<u8> {
+        if self.rvf_witness_entries.is_empty() {
+            return Vec::new();
+        }
+        rvf_create_witness_chain(&self.rvf_witness_entries)
+    }
+
+    /// Number of RVF witness entries accumulated so far.
+    pub fn rvf_witness_len(&self) -> usize {
+        self.rvf_witness_entries.len()
     }
 }
 
