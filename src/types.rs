@@ -22,15 +22,21 @@ pub enum EpisodeTier {
     Cold,
 }
 
-/// Result of the coherence check (Step 6).
+/// Result of the coherence check (Step 5).
+///
+/// | Score       | Variant        | Action                                  |
+/// |-------------|----------------|-----------------------------------------|
+/// | `< 0.3`     | **Reflex**     | Pass through directly, no revision      |
+/// | `0.3 – 0.8` | **Revised**    | Context revised/enriched before Claude   |
+/// | `> 0.8`     | **Halt**       | Block the request entirely (loop/abuse)  |
 #[derive(Debug, Clone)]
 pub enum CoherenceResult {
-    /// Contradiction energy below threshold → fast path (<1 ms)
+    /// Contradiction energy < 0.3 → fast path, no revision needed (<1 ms)
     Reflex,
-    /// Medium energy → context revised (~10 ms)
+    /// 0.3 ≤ energy ≤ 0.8 → context revised/enriched (~10 ms)
     Revised(String),
-    /// High energy → halt pipeline
-    Critical,
+    /// Energy > 0.8 → halt pipeline (potential loop/abuse)
+    Halt,
 }
 
 /// Claude tool definition (for MCP tools passed to the API).

@@ -155,7 +155,7 @@ async fn test_pipeline_with_invalid_base_url_fails_on_api_call() {
 fn test_error_variants_distinct() {
     let e1 = AiAssistantError::Config("c".to_string());
     let e2 = AiAssistantError::InputValidation("i".to_string());
-    let e3 = AiAssistantError::CoherenceCritical;
+    let e3 = AiAssistantError::CoherenceHalt;
     let e4 = AiAssistantError::ClaudeApi("a".to_string());
 
     // Each has a unique Display string

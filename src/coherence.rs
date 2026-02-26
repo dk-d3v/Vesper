@@ -50,9 +50,9 @@ impl CoherenceChecker {
 
     /// Check context for contradictions before sending to Claude.
     ///
-    /// - `Reflex`            → energy < [`REFLEX_THRESHOLD`]  (fast path, <1 ms)
-    /// - `Revised(new_ctx)` → [`REFLEX_THRESHOLD`] ≤ energy < [`CRITICAL_THRESHOLD`]
-    /// - `Critical`          → energy ≥ [`CRITICAL_THRESHOLD`] (halt)
+    /// - `Reflex`           → energy < 0.3  (fast path, no revision, <1 ms)
+    /// - `Revised(new_ctx)` → 0.3 ≤ energy ≤ 0.8  (context revised/enriched)
+    /// - `Halt`             → energy > 0.8  (block request — potential loop/abuse)
     pub fn check_context(&self, context: &str) -> Result<CoherenceResult, AiAssistantError> {
         if context.is_empty() {
             return Ok(CoherenceResult::Reflex);
@@ -62,11 +62,11 @@ impl CoherenceChecker {
 
         if energy < REFLEX_THRESHOLD {
             Ok(CoherenceResult::Reflex)
-        } else if energy < CRITICAL_THRESHOLD {
+        } else if energy <= CRITICAL_THRESHOLD {
             let revised = self.revise_context(context);
             Ok(CoherenceResult::Revised(revised))
         } else {
-            Ok(CoherenceResult::Critical)
+            Ok(CoherenceResult::Halt)
         }
     }
 

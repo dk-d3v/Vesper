@@ -17,8 +17,8 @@ pub enum AiAssistantError {
     #[error("Graph context error: {0}")]
     GraphContext(String),
 
-    #[error("Coherence critical halt: contradiction energy too high")]
-    CoherenceCritical,
+    #[error("⚠️ Coherence check failed: request blocked (score > 0.8)")]
+    CoherenceHalt,
 
     #[error("Claude API error: {0}")]
     ClaudeApi(String),

@@ -110,11 +110,11 @@ impl Pipeline {
                 context: new_ctx,
                 ..prompt
             },
-            CoherenceResult::Critical => {
+            CoherenceResult::Halt => {
                 let _ = self
                     .audit
-                    .record("COHERENCE_CRITICAL_HALT", AuditEntryType::SecurityHalt);
-                return Err(AiAssistantError::CoherenceCritical);
+                    .record("COHERENCE_HALT", AuditEntryType::SecurityHalt);
+                return Err(AiAssistantError::CoherenceHalt);
             }
         };
 
@@ -137,7 +137,7 @@ impl Pipeline {
     /// Execute a full 10-step conversation turn.
     ///
     /// Returns the final verified response text, or an error if a
-    /// non-degradable step fails (e.g. CoherenceCritical, Claude API error).
+    /// non-degradable step fails (e.g. CoherenceHalt, Claude API error).
     pub async fn execute_turn(&mut self, raw_input: &str) -> Result<String, AiAssistantError> {
         // Step 1 — validate input and detect language
         let msg = self.step1_receive(raw_input)?;
@@ -159,11 +159,11 @@ impl Pipeline {
                 context: new_ctx,
                 ..prompt
             },
-            CoherenceResult::Critical => {
+            CoherenceResult::Halt => {
                 let _ = self
                     .audit
-                    .record("COHERENCE_CRITICAL_HALT", AuditEntryType::SecurityHalt);
-                return Err(AiAssistantError::CoherenceCritical);
+                    .record("COHERENCE_HALT", AuditEntryType::SecurityHalt);
+                return Err(AiAssistantError::CoherenceHalt);
             }
         };
 

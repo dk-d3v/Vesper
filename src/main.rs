@@ -103,7 +103,7 @@ async fn main() {
                         // Stream already printed all tokens; just add the final newline.
                         println!("\n");
                     }
-                    Err(error::AiAssistantError::CoherenceCritical) => {
+                    Err(error::AiAssistantError::CoherenceHalt) => {
                         println!(
                             "\n\n⚠️  Critical contradiction detected. \
                              Please rephrase your message.\n"

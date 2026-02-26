@@ -108,7 +108,7 @@ fn test_episode_tier_clone_partial_eq() {
 fn test_coherence_result_variants() {
     let reflex = CoherenceResult::Reflex;
     let revised = CoherenceResult::Revised("new context".to_string());
-    let critical = CoherenceResult::Critical;
+    let halt = CoherenceResult::Halt;
 
     // Verify pattern matching works
     match reflex {
@@ -121,9 +121,9 @@ fn test_coherence_result_variants() {
         _ => panic!("Expected Revised"),
     }
 
-    match critical {
-        CoherenceResult::Critical => {}
-        _ => panic!("Expected Critical"),
+    match halt {
+        CoherenceResult::Halt => {}
+        _ => panic!("Expected Halt"),
     }
 }
 
