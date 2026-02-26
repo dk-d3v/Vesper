@@ -3,6 +3,14 @@
 //! Claude generates text only — all business logic remains in Rust.
 //! Handles multi-turn tool-use conversations with proper error mapping
 //! for 401, 429, and 5xx responses.
+//!
+//! # SSE Streaming
+//! `send_message_stream()` enables token-by-token delivery via a callback.
+//! It parses Anthropic's Server-Sent Events protocol and invokes the
+//! callback for every `text_delta` event.  Post-stream steps still receive
+//! the complete assembled text.
+
+use futures_util::StreamExt;
 
 use crate::{config::Config, error::AiAssistantError, types::{ClaudeResponse, Tool, ToolCall}};
 use serde_json::json;
@@ -44,9 +52,38 @@ impl ClaudeClient {
             "content": user_content
         })];
 
-        let body = self.build_body(config, system, &messages, tools);
+        let body = self.build_body(config, system, &messages, tools, false);
         let raw = self.post(config, body).await?;
         Self::parse_response(raw)
+    }
+
+    /// Stream a single-turn user message to Claude token-by-token.
+    ///
+    /// `on_token` is called for every text delta received from the SSE stream.
+    /// The method returns a complete [`ClaudeResponse`] after the stream ends.
+    ///
+    /// # Protocol
+    /// Sets `"stream": true` in the request body and parses Anthropic's SSE
+    /// format.  Events of type `content_block_delta` with `delta.type =
+    /// "text_delta"` produce token callbacks; all others are silently ignored.
+    pub async fn send_message_stream<F>(
+        &self,
+        config: &Config,
+        system: &str,
+        user_content: &str,
+        tools: &[Tool],
+        on_token: F,
+    ) -> Result<ClaudeResponse, AiAssistantError>
+    where
+        F: Fn(&str),
+    {
+        let messages = vec![json!({
+            "role": "user",
+            "content": user_content
+        })];
+
+        let body = self.build_body(config, system, &messages, tools, true);
+        self.post_stream(config, body, on_token).await
     }
 
     /// Send a follow-up message containing tool results (multi-turn tool use).
@@ -59,7 +96,7 @@ impl ClaudeClient {
         messages: &[serde_json::Value],
         tools: &[Tool],
     ) -> Result<ClaudeResponse, AiAssistantError> {
-        let body = self.build_body(config, system, messages, tools);
+        let body = self.build_body(config, system, messages, tools, false);
         let raw = self.post(config, body).await?;
         Self::parse_response(raw)
     }
@@ -67,12 +104,15 @@ impl ClaudeClient {
     // ── Private helpers ────────────────────────────────────────────────────
 
     /// Build the JSON request body.
+    ///
+    /// `stream` enables SSE streaming mode when `true`.
     fn build_body(
         &self,
         config: &Config,
         system: &str,
         messages: &[serde_json::Value],
         tools: &[Tool],
+        stream: bool,
     ) -> serde_json::Value {
         let mut body = json!({
             "model":      config.claude_model,
@@ -81,11 +121,105 @@ impl ClaudeClient {
             "messages":   messages,
         });
 
+        if stream {
+            body["stream"] = json!(true);
+        }
+
         if !tools.is_empty() {
             body["tools"] = serde_json::to_value(tools).unwrap_or(json!([]));
         }
 
         body
+    }
+
+    /// Execute a streaming POST request.
+    ///
+    /// Parses Anthropic SSE events and calls `on_token` for each
+    /// `text_delta`.  Accumulates the full response text and metadata
+    /// (model, usage) from `message_start` and `message_delta` events.
+    async fn post_stream<F>(
+        &self,
+        config: &Config,
+        body: serde_json::Value,
+        on_token: F,
+    ) -> Result<ClaudeResponse, AiAssistantError>
+    where
+        F: Fn(&str),
+    {
+        let url = format!("{}/v1/messages", config.anthropic_base_url);
+
+        let response = self
+            .client
+            .post(&url)
+            .header("x-api-key", &config.anthropic_api_key)
+            .header("content-type", "application/json")
+            .header("anthropic-version", "2023-06-01")
+            .json(&body)
+            .send()
+            .await
+            .map_err(AiAssistantError::Http)?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let error_body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "(unreadable body)".to_string());
+            return Err(map_http_error(status.as_u16(), &error_body));
+        }
+
+        // Accumulator state
+        let mut full_text = String::new();
+        let mut model = String::from("unknown");
+        let mut input_tokens: u32 = 0;
+        let mut output_tokens: u32 = 0;
+
+        // Buffer for partial SSE lines across chunk boundaries
+        let mut line_buf = String::new();
+        let mut byte_stream = response.bytes_stream();
+
+        while let Some(chunk) = byte_stream.next().await {
+            let bytes = chunk.map_err(AiAssistantError::Http)?;
+            let text = String::from_utf8_lossy(&bytes);
+
+            // Append bytes to line buffer and process complete lines
+            line_buf.push_str(&text);
+
+            // Process all complete lines (terminated by '\n')
+            while let Some(pos) = line_buf.find('\n') {
+                let line = line_buf[..pos].trim_end_matches('\r').to_string();
+                line_buf = line_buf[pos + 1..].to_string();
+
+                process_sse_line(
+                    &line,
+                    &on_token,
+                    &mut full_text,
+                    &mut model,
+                    &mut input_tokens,
+                    &mut output_tokens,
+                );
+            }
+        }
+
+        // Drain any remaining partial line
+        if !line_buf.trim().is_empty() {
+            process_sse_line(
+                line_buf.trim(),
+                &on_token,
+                &mut full_text,
+                &mut model,
+                &mut input_tokens,
+                &mut output_tokens,
+            );
+        }
+
+        Ok(ClaudeResponse {
+            text: full_text,
+            tool_calls: vec![], // Tool use not supported in streaming mode
+            model,
+            input_tokens,
+            output_tokens,
+        })
     }
 
     /// Execute the POST request and surface structured HTTP errors.
@@ -197,6 +331,81 @@ impl ClaudeClient {
     }
 }
 
+// ── SSE event parsing ─────────────────────────────────────────────────────────
+
+/// Process a single SSE line, updating accumulators and calling `on_token`.
+///
+/// Anthropic SSE events of interest:
+/// - `message_start` → carries model name and input token count
+/// - `content_block_delta` with `delta.type = "text_delta"` → text token
+/// - `message_delta` → carries final output token count
+fn process_sse_line<F>(
+    line: &str,
+    on_token: &F,
+    full_text: &mut String,
+    model: &mut String,
+    input_tokens: &mut u32,
+    output_tokens: &mut u32,
+) where
+    F: Fn(&str),
+{
+    // SSE data lines start with "data: "
+    let Some(data) = line.strip_prefix("data: ") else {
+        return; // event:, comment, or empty line — skip
+    };
+
+    // "[DONE]" sentinel closes the stream
+    if data.trim() == "[DONE]" {
+        return;
+    }
+
+    let Ok(event) = serde_json::from_str::<serde_json::Value>(data) else {
+        return; // malformed JSON — skip silently
+    };
+
+    match event.get("type").and_then(|t| t.as_str()) {
+        // Capture model name and input token count from stream start
+        Some("message_start") => {
+            if let Some(m) = event.pointer("/message/model").and_then(|v| v.as_str()) {
+                *model = m.to_string();
+            }
+            if let Some(tok) = event
+                .pointer("/message/usage/input_tokens")
+                .and_then(|v| v.as_u64())
+            {
+                *input_tokens = tok as u32;
+            }
+        }
+
+        // Text token delta — call the callback
+        Some("content_block_delta") => {
+            let delta_type = event
+                .pointer("/delta/type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            if delta_type == "text_delta" {
+                if let Some(token) = event.pointer("/delta/text").and_then(|v| v.as_str()) {
+                    on_token(token);
+                    full_text.push_str(token);
+                }
+            }
+        }
+
+        // Final output token count
+        Some("message_delta") => {
+            if let Some(tok) = event
+                .pointer("/usage/output_tokens")
+                .and_then(|v| v.as_u64())
+            {
+                *output_tokens = tok as u32;
+            }
+        }
+
+        _ => {} // ping, error, etc. — ignore
+    }
+}
+
 // ── HTTP error mapping ────────────────────────────────────────────────────────
 
 /// Maximum number of bytes from an HTTP error body included in error messages.
@@ -280,5 +489,76 @@ mod tests {
     fn map_503() {
         let err = map_http_error(503, "overloaded");
         assert!(err.to_string().contains("server error"));
+    }
+
+    #[test]
+    fn sse_text_delta_parsed() {
+        use std::cell::RefCell;
+
+        let line = r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#;
+        let mut text = String::new();
+        let mut model = String::new();
+        let mut input = 0u32;
+        let mut output = 0u32;
+        let tokens: RefCell<Vec<String>> = RefCell::new(Vec::new());
+
+        process_sse_line(
+            line,
+            &|t: &str| tokens.borrow_mut().push(t.to_string()),
+            &mut text,
+            &mut model,
+            &mut input,
+            &mut output,
+        );
+
+        assert_eq!(*tokens.borrow(), vec!["Hello"]);
+        assert_eq!(text, "Hello");
+    }
+
+    #[test]
+    fn sse_message_start_captures_model() {
+        let line = r#"data: {"type":"message_start","message":{"model":"claude-opus-4-6","usage":{"input_tokens":42}}}"#;
+        let mut text = String::new();
+        let mut model = String::new();
+        let mut input = 0u32;
+        let mut output = 0u32;
+
+        process_sse_line(
+            line,
+            &|_| {},
+            &mut text,
+            &mut model,
+            &mut input,
+            &mut output,
+        );
+
+        assert_eq!(model, "claude-opus-4-6");
+        assert_eq!(input, 42);
+    }
+
+    #[test]
+    fn sse_non_data_lines_ignored() {
+        use std::cell::Cell;
+
+        let lines = ["event: content_block_delta", ": ping", ""];
+        let mut text = String::new();
+        let mut model = String::new();
+        let mut input = 0u32;
+        let mut output = 0u32;
+        let called = Cell::new(false);
+
+        for line in &lines {
+            process_sse_line(
+                line,
+                &|_| called.set(true),
+                &mut text,
+                &mut model,
+                &mut input,
+                &mut output,
+            );
+        }
+
+        assert!(!called.get());
+        assert!(text.is_empty());
     }
 }

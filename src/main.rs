@@ -2,6 +2,11 @@
 //!
 //! Initialises all pipeline components from environment configuration and
 //! runs an interactive REPL loop. Press Ctrl+C or type `/quit` to exit.
+//!
+//! # SSE Streaming
+//! Each response is streamed token-by-token via the Anthropic SSE protocol.
+//! Tokens are printed with `print!` + `stdout().flush()` as they arrive,
+//! giving the user a typewriter-style display.
 
 use std::io::{self, BufRead, Write};
 
@@ -61,7 +66,7 @@ async fn main() {
 
     println!("💬 Type your message (Ctrl+C or /quit to exit)\n");
 
-    // REPL loop — one `execute_turn` call per user input line.
+    // REPL loop — one `execute_turn_stream` call per user input line.
     let stdin = io::stdin();
     loop {
         print!("You: ");
@@ -79,16 +84,33 @@ async fn main() {
                     break;
                 }
 
-                match pipeline.execute_turn(input).await {
-                    Ok(response) => println!("\nAssistant: {}\n", response),
+                // Print the "Assistant: " prefix before streaming begins
+                print!("\nAssistant: ");
+                io::stdout().flush().unwrap_or_default();
+
+                // Token-by-token streaming callback:
+                // each delta is printed immediately without a trailing newline.
+                let token_callback = || {
+                    move |token: &str| {
+                        print!("{}", token);
+                        // Flush on every token so the terminal shows it immediately.
+                        let _ = io::stdout().flush();
+                    }
+                };
+
+                match pipeline.execute_turn_stream(input, token_callback()).await {
+                    Ok(_response) => {
+                        // Stream already printed all tokens; just add the final newline.
+                        println!("\n");
+                    }
                     Err(error::AiAssistantError::CoherenceCritical) => {
                         println!(
-                            "\n⚠️  Critical contradiction detected. \
+                            "\n\n⚠️  Critical contradiction detected. \
                              Please rephrase your message.\n"
                         );
                     }
                     Err(e) => {
-                        eprintln!("\n❌ Error: {}\n", e);
+                        eprintln!("\n\n❌ Error: {}\n", e);
                     }
                 }
             }

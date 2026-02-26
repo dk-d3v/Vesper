@@ -77,6 +77,63 @@ impl Pipeline {
         })
     }
 
+    /// Execute a full 10-step conversation turn with SSE streaming.
+    ///
+    /// `on_token` is called for every text delta received from Claude.
+    /// The pipeline still runs all 10 steps — steps 7-10 receive the
+    /// fully assembled response text after the stream completes.
+    pub async fn execute_turn_stream<F>(
+        &mut self,
+        raw_input: &str,
+        on_token: F,
+    ) -> Result<String, AiAssistantError>
+    where
+        F: Fn(&str) + Send + 'static,
+    {
+        // Step 1 — validate input and detect language
+        let msg = self.step1_receive(raw_input)?;
+
+        // Step 2 — semantic memory search
+        let semantic = self.step2_semantic_search(&msg)?;
+
+        // Step 3 — graph context (graceful degradation)
+        let graph_ctx = self.step3_graph_context(&msg)?;
+
+        // Step 4 — merge context and prepare prompt
+        let prompt = self.step4_prepare_prompt(&msg, &semantic, &graph_ctx)?;
+
+        // Step 5 — pre-API coherence check
+        let coherence = self.step5_coherence_check(&prompt)?;
+        let prompt = match coherence {
+            CoherenceResult::Reflex => prompt,
+            CoherenceResult::Revised(new_ctx) => FinalPrompt {
+                context: new_ctx,
+                ..prompt
+            },
+            CoherenceResult::Critical => {
+                let _ = self
+                    .audit
+                    .record("COHERENCE_CRITICAL_HALT", AuditEntryType::SecurityHalt);
+                return Err(AiAssistantError::CoherenceCritical);
+            }
+        };
+
+        // Step 6 — streaming Claude API call (token-by-token)
+        let claude_resp = self.step6_claude_call_stream(&prompt, on_token).await?;
+
+        // Step 7 — post-response security / hallucination check
+        let verified = self.step7_security_check(claude_resp, &prompt)?;
+
+        // Step 8 — SONA learning record (graceful degradation)
+        let _ = self.step8_learning(&msg, &prompt, &verified);
+
+        // Step 9 — AgenticDB update + RVF audit (graceful degradation)
+        let _ = self.step9_update_and_audit(&msg, &verified);
+
+        // Step 10 — return verified response, update session
+        Ok(self.step10_return(msg, verified))
+    }
+
     /// Execute a full 10-step conversation turn.
     ///
     /// Returns the final verified response text, or an error if a
@@ -221,6 +278,33 @@ impl Pipeline {
             return Ok(CoherenceResult::Reflex);
         }
         self.coherence.check_context(&prompt.context)
+    }
+
+    /// STEP 6 (streaming) — Call Claude API with SSE token callbacks.
+    ///
+    /// Uses `send_message_stream()` instead of `send_message()` so the REPL
+    /// can display tokens as they arrive.  Tool-use is not supported in
+    /// streaming mode; if the response would require tool calls the fallback
+    /// `send_message()` path is taken automatically (degradation).
+    async fn step6_claude_call_stream<F>(
+        &self,
+        prompt: &FinalPrompt,
+        on_token: F,
+    ) -> Result<ClaudeResponse, AiAssistantError>
+    where
+        F: Fn(&str) + Send + 'static,
+    {
+        let tools = self.mcp.get_tools();
+
+        self.claude
+            .send_message_stream(
+                &self.config,
+                &prompt.system,
+                &prompt.full_content(),
+                tools,
+                on_token,
+            )
+            .await
     }
 
     /// STEP 6 — Call Claude API (with optional MCP tool use).

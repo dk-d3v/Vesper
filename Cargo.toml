@@ -24,7 +24,8 @@ ruvector-mincut              = { path = "./ruvector/crates/ruvector-mincut", fea
 ruvector-temporal-tensor     = { path = "./ruvector/crates/ruvector-temporal-tensor" }
 rvf-runtime                  = { path = "./ruvector/crates/rvf/rvf-runtime" }
 rvf-crypto                   = { path = "./ruvector/crates/rvf/rvf-crypto" }
-reqwest    = { version = "0.11", features = ["json"] }
+reqwest    = { version = "0.11", features = ["json", "stream"] }
+futures-util = "0.3"
 tokio      = { version = "1", features = ["full"] }
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
