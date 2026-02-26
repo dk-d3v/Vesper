@@ -151,3 +151,45 @@ fn test_constants_have_expected_values() {
     assert_eq!(MEMORY_TOP_K, 10, "MEMORY_TOP_K should be 10");
     assert_eq!(SKILL_TOP_K, 5, "SKILL_TOP_K should be 5");
 }
+
+/// Test 7: CLAUDE_THINKING_BUDGET_TOKENS=5000 sets thinking_budget_tokens to 5000.
+#[test]
+fn test_thinking_budget_tokens_parsed_from_env() {
+    let _lock = lock_env();
+    let _key = EnvGuard::set("ANTHROPIC_API_KEY", "mock-key");
+    let _url = EnvGuard::set("ANTHROPIC_BASE_URL", "https://api.anthropic.com");
+    let _budget = EnvGuard::set("CLAUDE_THINKING_BUDGET_TOKENS", "5000");
+
+    let result = load_config_from_env();
+    assert!(result.is_ok(), "Expected Ok, got: {:?}", result.err());
+    let cfg = result.unwrap();
+    assert_eq!(cfg.thinking_budget_tokens, 5000, "thinking_budget_tokens should be 5000");
+}
+
+/// Test 8: Unset CLAUDE_THINKING_BUDGET_TOKENS defaults to 0 (disabled).
+#[test]
+fn test_thinking_budget_tokens_defaults_to_zero() {
+    let _lock = lock_env();
+    let _key = EnvGuard::set("ANTHROPIC_API_KEY", "mock-key");
+    let _url = EnvGuard::set("ANTHROPIC_BASE_URL", "https://api.anthropic.com");
+    let _budget = EnvGuard::remove("CLAUDE_THINKING_BUDGET_TOKENS");
+
+    let result = load_config_from_env();
+    assert!(result.is_ok(), "Expected Ok, got: {:?}", result.err());
+    let cfg = result.unwrap();
+    assert_eq!(cfg.thinking_budget_tokens, 0, "thinking_budget_tokens should be 0 when unset");
+}
+
+/// Test 9: Invalid CLAUDE_THINKING_BUDGET_TOKENS (non-numeric) falls back to 0.
+#[test]
+fn test_thinking_budget_tokens_invalid_value_defaults_to_zero() {
+    let _lock = lock_env();
+    let _key = EnvGuard::set("ANTHROPIC_API_KEY", "mock-key");
+    let _url = EnvGuard::set("ANTHROPIC_BASE_URL", "https://api.anthropic.com");
+    let _budget = EnvGuard::set("CLAUDE_THINKING_BUDGET_TOKENS", "not-a-number");
+
+    let result = load_config_from_env();
+    assert!(result.is_ok(), "Expected Ok with fallback, got: {:?}", result.err());
+    let cfg = result.unwrap();
+    assert_eq!(cfg.thinking_budget_tokens, 0, "Invalid value should fall back to 0");
+}

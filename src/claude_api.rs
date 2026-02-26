@@ -106,6 +106,10 @@ impl ClaudeClient {
     /// Build the JSON request body.
     ///
     /// `stream` enables SSE streaming mode when `true`.
+    ///
+    /// When `config.thinking_budget_tokens > 0`, extended thinking is enabled:
+    /// - `temperature` and `top_k` are omitted (incompatible with thinking API)
+    /// - `max_tokens` is set to `budget_tokens + 4096` so it exceeds the budget
     fn build_body(
         &self,
         config: &Config,
@@ -114,9 +118,18 @@ impl ClaudeClient {
         tools: &[Tool],
         stream: bool,
     ) -> serde_json::Value {
+        let thinking_enabled = config.thinking_budget_tokens > 0;
+
+        // When thinking is enabled, max_tokens must exceed budget_tokens.
+        let max_tokens: u32 = if thinking_enabled {
+            config.thinking_budget_tokens + 4096
+        } else {
+            4096
+        };
+
         let mut body = json!({
             "model":      config.claude_model,
-            "max_tokens": 4096,
+            "max_tokens": max_tokens,
             "system":     system,
             "messages":   messages,
         });
@@ -127,6 +140,14 @@ impl ClaudeClient {
 
         if !tools.is_empty() {
             body["tools"] = serde_json::to_value(tools).unwrap_or(json!([]));
+        }
+
+        // Extended thinking — temperature/top_k must NOT be set alongside thinking.
+        if thinking_enabled {
+            body["thinking"] = json!({
+                "type": "enabled",
+                "budget_tokens": config.thinking_budget_tokens
+            });
         }
 
         body
@@ -377,18 +398,45 @@ fn process_sse_line<F>(
             }
         }
 
-        // Text token delta — call the callback
+        // Content block start — emit prefix markers for thinking/text blocks
+        Some("content_block_start") => {
+            let block_type = event
+                .pointer("/content_block/type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            if block_type == "thinking" {
+                on_token("\n💭 Thinking: ");
+            }
+            // text blocks: the "Assistant: " label is already printed in main.rs
+        }
+
+        // Content block delta — handles text_delta, thinking_delta, signature_delta
         Some("content_block_delta") => {
             let delta_type = event
                 .pointer("/delta/type")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
 
-            if delta_type == "text_delta" {
-                if let Some(token) = event.pointer("/delta/text").and_then(|v| v.as_str()) {
-                    on_token(token);
-                    full_text.push_str(token);
+            match delta_type {
+                "text_delta" => {
+                    if let Some(token) = event.pointer("/delta/text").and_then(|v| v.as_str()) {
+                        on_token(token);
+                        full_text.push_str(token);
+                    }
                 }
+                "thinking_delta" => {
+                    if let Some(thinking) = event
+                        .pointer("/delta/thinking")
+                        .and_then(|v| v.as_str())
+                    {
+                        on_token(thinking);
+                    }
+                }
+                "signature_delta" => {
+                    // Verification signature — not displayed to the user
+                }
+                _ => {}
             }
         }
 
@@ -560,5 +608,98 @@ mod tests {
 
         assert!(!called.get());
         assert!(text.is_empty());
+    }
+
+    #[test]
+    fn sse_thinking_delta_calls_on_token() {
+        use std::cell::RefCell;
+
+        let line = r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"I am reasoning..."}}"#;
+        let mut text = String::new();
+        let mut model = String::new();
+        let mut input = 0u32;
+        let mut output = 0u32;
+        let tokens: RefCell<Vec<String>> = RefCell::new(Vec::new());
+
+        process_sse_line(
+            line,
+            &|t: &str| tokens.borrow_mut().push(t.to_string()),
+            &mut text,
+            &mut model,
+            &mut input,
+            &mut output,
+        );
+
+        assert_eq!(*tokens.borrow(), vec!["I am reasoning..."]);
+        // Thinking tokens do NOT contribute to full_text
+        assert!(text.is_empty(), "thinking_delta should not update full_text");
+    }
+
+    #[test]
+    fn sse_content_block_start_thinking_emits_prefix() {
+        use std::cell::RefCell;
+
+        let line = r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#;
+        let mut text = String::new();
+        let mut model = String::new();
+        let mut input = 0u32;
+        let mut output = 0u32;
+        let tokens: RefCell<Vec<String>> = RefCell::new(Vec::new());
+
+        process_sse_line(
+            line,
+            &|t: &str| tokens.borrow_mut().push(t.to_string()),
+            &mut text,
+            &mut model,
+            &mut input,
+            &mut output,
+        );
+
+        let emitted = tokens.borrow();
+        assert!(!emitted.is_empty(), "Should emit thinking prefix token");
+        assert!(
+            emitted[0].contains("💭"),
+            "Thinking prefix should contain 💭, got: {:?}",
+            emitted[0]
+        );
+    }
+
+    #[test]
+    fn sse_signature_delta_ignored() {
+        use std::cell::Cell;
+
+        let line = r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"abc123"}}"#;
+        let mut text = String::new();
+        let mut model = String::new();
+        let mut input = 0u32;
+        let mut output = 0u32;
+        let called = Cell::new(false);
+
+        process_sse_line(
+            line,
+            &|_| called.set(true),
+            &mut text,
+            &mut model,
+            &mut input,
+            &mut output,
+        );
+
+        assert!(!called.get(), "signature_delta should not call on_token");
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn parse_response_skips_thinking_blocks() {
+        let json = serde_json::json!({
+            "model": "claude-opus-4-6",
+            "content": [
+                {"type": "thinking", "thinking": "Internal reasoning here"},
+                {"type": "text", "text": "Final answer"}
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+        let resp = ClaudeClient::parse_response(json).unwrap();
+        assert_eq!(resp.text, "Final answer", "Only text blocks should be in response text");
+        assert!(resp.tool_calls.is_empty());
     }
 }
