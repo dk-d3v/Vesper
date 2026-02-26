@@ -43,10 +43,10 @@ default = []
 onnx    = ["dep:ort", "dep:ndarray"]
 
 [dependencies.ort]
-version  = "2.0.0-rc.9"
+version  = "=2.0.0-rc.9"
 features = ["load-dynamic", "ndarray"]
 optional = true
 
 [dependencies.ndarray]
-version  = "0.17"
+version  = "0.16"
 optional = true

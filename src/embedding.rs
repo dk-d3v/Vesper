@@ -145,6 +145,7 @@ impl OnnxEmbedding {
         text: &str,
     ) -> Result<Vec<f32>, AiAssistantError> {
         use ndarray::Array2;
+        use ort::value::Tensor;
 
         let (input_ids, attention_mask) = Self::tokenize(text, MAX_SEQ_LEN);
         let seq_len = input_ids.len();
@@ -158,32 +159,37 @@ impl OnnxEmbedding {
         let types_arr = Array2::from_shape_vec((1, seq_len), token_type_ids)
             .map_err(|e| AiAssistantError::Embedding(e.to_string()))?;
 
-        // ort 2.0.0-rc.11: Tensor lives in ort::value module
-        let ids_val = ort::value::Tensor::from_array(ids_arr)
+        // ort 2.0.0-rc.9: Tensor lives in ort::value module
+        let ids_val = Tensor::from_array(ids_arr)
             .map_err(|e: ort::Error| AiAssistantError::Embedding(e.to_string()))?;
-        let mask_val = ort::value::Tensor::from_array(mask_arr)
+        let mask_val = Tensor::from_array(mask_arr)
             .map_err(|e: ort::Error| AiAssistantError::Embedding(e.to_string()))?;
-        let types_val = ort::value::Tensor::from_array(types_arr)
+        let types_val = Tensor::from_array(types_arr)
             .map_err(|e: ort::Error| AiAssistantError::Embedding(e.to_string()))?;
 
         // Lock the mutex to get &mut Session — Session::run() requires &mut self
         let mut guard = session
             .lock()
             .map_err(|_| AiAssistantError::Embedding("Session mutex poisoned".to_string()))?;
-        let outputs = guard
-            .run(ort::inputs![
-                "input_ids"      => ids_val,
-                "attention_mask" => mask_val,
-                "token_type_ids" => types_val
-            ])
-            .map_err(|e| AiAssistantError::Embedding(e.to_string()))?;
 
-        // try_extract_tensor returns (&Shape, &[T]) — .1 is the raw float slice
-        let (_shape, data) = outputs["last_hidden_state"]
+        // ort rc.9: ort::inputs! returns Result<Vec<...>> — unwrap with ? first
+        let session_inputs = ort::inputs![
+            "input_ids"      => ids_val,
+            "attention_mask" => mask_val,
+            "token_type_ids" => types_val
+        ]
+        .map_err(|e: ort::Error| AiAssistantError::Embedding(e.to_string()))?;
+
+        let outputs = guard
+            .run(session_inputs)
+            .map_err(|e: ort::Error| AiAssistantError::Embedding(e.to_string()))?;
+
+        // ort rc.9: try_extract_tensor returns ArrayBase directly (not a tuple)
+        let tensor = outputs["last_hidden_state"]
             .try_extract_tensor::<f32>()
             .map_err(|e: ort::Error| AiAssistantError::Embedding(e.to_string()))?;
 
-        let flat: Vec<f32> = data.to_vec();
+        let flat: Vec<f32> = tensor.iter().copied().collect();
 
         // Reshape to Vec<Vec<f32>> of shape [seq_len][384]
         let mut token_embs: Vec<Vec<f32>> = Vec::with_capacity(seq_len);
