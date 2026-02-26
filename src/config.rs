@@ -23,6 +23,9 @@ pub struct Config {
     pub thinking_adaptive: bool,
     /// Adaptive thinking effort level — sourced from `CLAUDE_THINKING_EFFORT`.
     /// Valid values: `"low"` | `"medium"` | `"high"`. Invalid values silently become `None`.
+    /// NOTE: `"max"` is intentionally excluded — it is Opus 4.6 only and returns an API
+    /// error on Sonnet 4.6 and all other models. Users who explicitly need `max` must pass
+    /// the raw API parameter themselves rather than relying on this config field.
     /// Sent as `output_config: {effort: "..."}` alongside `thinking: {type: "adaptive"}`.
     pub thinking_effort: Option<String>,
 }
@@ -80,9 +83,12 @@ pub fn load_config_from_env() -> Result<Config, AiAssistantError> {
         .map(|v| v.to_lowercase() == "true")
         .unwrap_or(false);
 
+    // "max" is deliberately excluded: it is Opus 4.6 only and the API returns an error
+    // when used with Sonnet 4.6 or any other model. Silently ignore it so misconfigured
+    // environments degrade gracefully to the API default ("high") instead of hard-failing.
     let thinking_effort = std::env::var("CLAUDE_THINKING_EFFORT")
         .ok()
-        .filter(|v| matches!(v.as_str(), "low" | "medium" | "high" | "max"));
+        .filter(|v| matches!(v.as_str(), "low" | "medium" | "high"));
 
     Ok(Config {
         anthropic_api_key: api_key,
