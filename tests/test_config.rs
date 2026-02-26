@@ -193,3 +193,61 @@ fn test_thinking_budget_tokens_invalid_value_defaults_to_zero() {
     let cfg = result.unwrap();
     assert_eq!(cfg.thinking_budget_tokens, 0, "Invalid value should fall back to 0");
 }
+
+/// Test 10: CLAUDE_THINKING_ADAPTIVE=true sets thinking_adaptive to true.
+#[test]
+fn test_thinking_adaptive_true_from_env() {
+    let _lock = lock_env();
+    let _key = EnvGuard::set("ANTHROPIC_API_KEY", "mock-key");
+    let _url = EnvGuard::set("ANTHROPIC_BASE_URL", "https://api.anthropic.com");
+    let _adaptive = EnvGuard::set("CLAUDE_THINKING_ADAPTIVE", "true");
+
+    let result = load_config_from_env();
+    assert!(result.is_ok(), "Expected Ok, got: {:?}", result.err());
+    let cfg = result.unwrap();
+    assert!(cfg.thinking_adaptive, "thinking_adaptive should be true");
+}
+
+/// Test 11: CLAUDE_THINKING_EFFORT=high sets thinking_effort to Some("high").
+#[test]
+fn test_thinking_effort_high_from_env() {
+    let _lock = lock_env();
+    let _key = EnvGuard::set("ANTHROPIC_API_KEY", "mock-key");
+    let _url = EnvGuard::set("ANTHROPIC_BASE_URL", "https://api.anthropic.com");
+    let _effort = EnvGuard::set("CLAUDE_THINKING_EFFORT", "high");
+
+    let result = load_config_from_env();
+    assert!(result.is_ok(), "Expected Ok, got: {:?}", result.err());
+    let cfg = result.unwrap();
+    assert_eq!(cfg.thinking_effort, Some("high".to_string()), "thinking_effort should be Some(\"high\")");
+}
+
+/// Test 12: CLAUDE_THINKING_EFFORT=invalid silently falls back to None.
+#[test]
+fn test_thinking_effort_invalid_value_defaults_to_none() {
+    let _lock = lock_env();
+    let _key = EnvGuard::set("ANTHROPIC_API_KEY", "mock-key");
+    let _url = EnvGuard::set("ANTHROPIC_BASE_URL", "https://api.anthropic.com");
+    let _effort = EnvGuard::set("CLAUDE_THINKING_EFFORT", "invalid-level");
+
+    let result = load_config_from_env();
+    assert!(result.is_ok(), "Expected Ok with fallback, got: {:?}", result.err());
+    let cfg = result.unwrap();
+    assert_eq!(cfg.thinking_effort, None, "Invalid effort value should fall back to None");
+}
+
+/// Test 13: Unset adaptive and effort vars → thinking_adaptive=false, thinking_effort=None.
+#[test]
+fn test_thinking_adaptive_and_effort_defaults_when_unset() {
+    let _lock = lock_env();
+    let _key = EnvGuard::set("ANTHROPIC_API_KEY", "mock-key");
+    let _url = EnvGuard::set("ANTHROPIC_BASE_URL", "https://api.anthropic.com");
+    let _adaptive = EnvGuard::remove("CLAUDE_THINKING_ADAPTIVE");
+    let _effort = EnvGuard::remove("CLAUDE_THINKING_EFFORT");
+
+    let result = load_config_from_env();
+    assert!(result.is_ok(), "Expected Ok, got: {:?}", result.err());
+    let cfg = result.unwrap();
+    assert!(!cfg.thinking_adaptive, "thinking_adaptive should be false when unset");
+    assert_eq!(cfg.thinking_effort, None, "thinking_effort should be None when unset");
+}

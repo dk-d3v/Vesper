@@ -17,6 +17,14 @@ pub struct Config {
     /// Extended thinking budget in tokens — sourced from `CLAUDE_THINKING_BUDGET_TOKENS`.
     /// `0` means extended thinking is disabled.
     pub thinking_budget_tokens: u32,
+    /// Enable adaptive thinking mode — sourced from `CLAUDE_THINKING_ADAPTIVE`.
+    /// When `true`, sends `thinking: {type: "adaptive"}` instead of manual budget mode.
+    /// Supported on Claude Opus 4.6 and Sonnet 4.6. Takes precedence over `thinking_budget_tokens`.
+    pub thinking_adaptive: bool,
+    /// Adaptive thinking effort level — sourced from `CLAUDE_THINKING_EFFORT`.
+    /// Valid values: `"low"` | `"medium"` | `"high"`. Invalid values silently become `None`.
+    /// Sent as `output_config: {effort: "..."}` alongside `thinking: {type: "adaptive"}`.
+    pub thinking_effort: Option<String>,
 }
 
 /// Load configuration purely from already-set environment variables.
@@ -68,12 +76,22 @@ pub fn load_config_from_env() -> Result<Config, AiAssistantError> {
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(0);
 
+    let thinking_adaptive = std::env::var("CLAUDE_THINKING_ADAPTIVE")
+        .map(|v| v.to_lowercase() == "true")
+        .unwrap_or(false);
+
+    let thinking_effort = std::env::var("CLAUDE_THINKING_EFFORT")
+        .ok()
+        .filter(|v| matches!(v.as_str(), "low" | "medium" | "high" | "max"));
+
     Ok(Config {
         anthropic_api_key: api_key,
         anthropic_base_url: base_url,
         claude_model,
         embedding_model_path,
         thinking_budget_tokens,
+        thinking_adaptive,
+        thinking_effort,
     })
 }
 

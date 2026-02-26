@@ -107,9 +107,16 @@ impl ClaudeClient {
     ///
     /// `stream` enables SSE streaming mode when `true`.
     ///
-    /// When `config.thinking_budget_tokens > 0`, extended thinking is enabled:
-    /// - `temperature` and `top_k` are omitted (incompatible with thinking API)
-    /// - `max_tokens` is set to `budget_tokens + 4096` so it exceeds the budget
+    /// Thinking priority logic (adaptive takes precedence over manual):
+    /// 1. If `config.thinking_adaptive == true`:
+    ///    - Sets `thinking: {type: "adaptive"}`
+    ///    - If `config.thinking_effort` is `Some(level)`, sets `output_config: {effort: level}`
+    ///    - Does NOT set `budget_tokens` (incompatible with adaptive mode)
+    ///    - Does NOT set `temperature`/`top_k` (incompatible with thinking)
+    /// 2. Else if `config.thinking_budget_tokens > 0`:
+    ///    - Sets `thinking: {type: "enabled", budget_tokens: N}`
+    ///    - Sets `max_tokens` to `budget_tokens + 4096`
+    /// 3. Else: no thinking parameters added
     fn build_body(
         &self,
         config: &Config,
@@ -118,10 +125,11 @@ impl ClaudeClient {
         tools: &[Tool],
         stream: bool,
     ) -> serde_json::Value {
-        let thinking_enabled = config.thinking_budget_tokens > 0;
+        let manual_thinking_enabled = !config.thinking_adaptive && config.thinking_budget_tokens > 0;
 
-        // When thinking is enabled, max_tokens must exceed budget_tokens.
-        let max_tokens: u32 = if thinking_enabled {
+        // When manual thinking is enabled, max_tokens must exceed budget_tokens.
+        // For adaptive mode, use a sensible default max_tokens.
+        let max_tokens: u32 = if manual_thinking_enabled {
             config.thinking_budget_tokens + 4096
         } else {
             4096
@@ -142,8 +150,14 @@ impl ClaudeClient {
             body["tools"] = serde_json::to_value(tools).unwrap_or(json!([]));
         }
 
-        // Extended thinking — temperature/top_k must NOT be set alongside thinking.
-        if thinking_enabled {
+        // Adaptive thinking takes precedence over manual budget mode.
+        // temperature/top_k must NOT be set alongside any thinking mode.
+        if config.thinking_adaptive {
+            body["thinking"] = json!({"type": "adaptive"});
+            if let Some(ref effort) = config.thinking_effort {
+                body["output_config"] = json!({"effort": effort});
+            }
+        } else if manual_thinking_enabled {
             body["thinking"] = json!({
                 "type": "enabled",
                 "budget_tokens": config.thinking_budget_tokens
@@ -701,5 +715,78 @@ mod tests {
         let resp = ClaudeClient::parse_response(json).unwrap();
         assert_eq!(resp.text, "Final answer", "Only text blocks should be in response text");
         assert!(resp.tool_calls.is_empty());
+    }
+
+    // ── Adaptive thinking build_body tests ───────────────────────────────────
+
+    fn make_config(thinking_adaptive: bool, effort: Option<&str>, budget: u32) -> Config {
+        Config {
+            anthropic_api_key: "test-key".to_string(),
+            anthropic_base_url: "https://api.anthropic.com".to_string(),
+            claude_model: "claude-opus-4-6".to_string(),
+            embedding_model_path: "./models/test".to_string(),
+            thinking_budget_tokens: budget,
+            thinking_adaptive,
+            thinking_effort: effort.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn build_body_adaptive_with_effort_sets_correct_fields() {
+        let client = ClaudeClient::new();
+        let config = make_config(true, Some("medium"), 0);
+        let body = client.build_body(&config, "system", &[], &[], false);
+
+        let thinking = body.get("thinking").expect("thinking field must be present");
+        assert_eq!(thinking["type"], "adaptive", "type should be 'adaptive'");
+        assert!(thinking.get("budget_tokens").is_none(), "budget_tokens must NOT be in adaptive mode");
+
+        let output_config = body.get("output_config").expect("output_config must be present");
+        assert_eq!(output_config["effort"], "medium", "effort should be 'medium'");
+    }
+
+    #[test]
+    fn build_body_adaptive_without_effort_has_no_output_config() {
+        let client = ClaudeClient::new();
+        let config = make_config(true, None, 0);
+        let body = client.build_body(&config, "system", &[], &[], false);
+
+        let thinking = body.get("thinking").expect("thinking field must be present");
+        assert_eq!(thinking["type"], "adaptive");
+        assert!(body.get("output_config").is_none(), "output_config must NOT be present when no effort");
+    }
+
+    #[test]
+    fn build_body_adaptive_wins_over_budget_tokens() {
+        let client = ClaudeClient::new();
+        // Both adaptive=true AND budget_tokens=5000 → adaptive must win
+        let config = make_config(true, Some("high"), 5000);
+        let body = client.build_body(&config, "system", &[], &[], false);
+
+        let thinking = body.get("thinking").expect("thinking field must be present");
+        assert_eq!(thinking["type"], "adaptive", "adaptive must take precedence");
+        assert!(thinking.get("budget_tokens").is_none(), "budget_tokens must NOT appear in body");
+    }
+
+    #[test]
+    fn build_body_manual_thinking_when_adaptive_false() {
+        let client = ClaudeClient::new();
+        let config = make_config(false, None, 5000);
+        let body = client.build_body(&config, "system", &[], &[], false);
+
+        let thinking = body.get("thinking").expect("thinking field must be present");
+        assert_eq!(thinking["type"], "enabled");
+        assert_eq!(thinking["budget_tokens"], 5000);
+        assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn build_body_no_thinking_when_both_disabled() {
+        let client = ClaudeClient::new();
+        let config = make_config(false, None, 0);
+        let body = client.build_body(&config, "system", &[], &[], false);
+
+        assert!(body.get("thinking").is_none(), "No thinking should be set when both disabled");
+        assert!(body.get("output_config").is_none());
     }
 }
