@@ -448,10 +448,11 @@ impl Pipeline {
         verified: &VerifiedResponse,
         quality_score: f32,
     ) -> Result<AuditResult, AiAssistantError> {
-        // Store episode in memory
+        // Store episode in memory — save user+assistant pair for cross-session recall
+        let episode_text = format!("User: {}\nAssistant: {}", msg.text, verified.text);
         let _episode_id = self
             .memory
-            .store_episode(&verified.text, quality_score)
+            .store_episode(&episode_text, quality_score)
             .unwrap_or_else(|e| {
                 tracing::warn!("Episode storage failed: {}", e);
                 "unknown".to_string()
