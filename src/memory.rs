@@ -92,8 +92,46 @@ fn reflexion_to_episode(
 // ── Core impl ─────────────────────────────────────────────────────────────────
 
 impl MemoryStore {
-    /// Initialise the store with `OnnxEmbedding`. Never falls through to
-    /// `HashEmbedding`.
+    /// Initialise the store with a shared `Arc<OnnxEmbedding>`.
+    ///
+    /// Preferred constructor when the same embedding model is also used by
+    /// `GraphContextProvider` — avoids loading the ONNX model twice.
+    pub fn new_with_arc(embedding_arc: Arc<OnnxEmbedding>) -> Result<Self, AiAssistantError> {
+        // Coerce Arc<OnnxEmbedding> → Arc<dyn EmbeddingProvider>
+        let provider: BoxedEmbeddingProvider = embedding_arc.clone();
+
+        let options = DbOptions {
+            dimensions: EMBEDDING_DIM,
+            storage_path: "./data/agenticdb.db".to_string(),
+            ..DbOptions::default()
+        };
+
+        let backend = match AgenticDB::with_embedding_provider(options, provider) {
+            Ok(db) => {
+                info!("AgenticDB initialised with OnnxEmbedding provider");
+                MemoryBackend::Agentic(db)
+            }
+            Err(e) => {
+                warn!(
+                    "AgenticDB init failed ({}); falling back to in-memory store",
+                    e
+                );
+                MemoryBackend::InMemory(Vec::new())
+            }
+        };
+
+        Ok(Self {
+            embedding: embedding_arc,
+            backend,
+            causal_cache: Vec::new(),
+            quality_map: HashMap::new(),
+        })
+    }
+
+    /// Initialise the store with `OnnxEmbedding` (takes ownership).
+    ///
+    /// Wraps the value in `Arc` internally. Prefer [`MemoryStore::new_with_arc`]
+    /// when sharing the embedding model with other components.
     pub fn new(embedding: OnnxEmbedding) -> Result<Self, AiAssistantError> {
         let embedding_arc: Arc<OnnxEmbedding> = Arc::new(embedding);
 

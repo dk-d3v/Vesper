@@ -47,14 +47,13 @@ pub struct Pipeline {
 impl Pipeline {
     /// Initialise all components from `config`.
     ///
-    /// Two `OnnxEmbedding` instances are created — one for `MemoryStore`
-    /// (which takes ownership) and one for `GraphContextProvider` (Arc).
+    /// A single `OnnxEmbedding` is loaded once and shared via `Arc` between
+    /// `MemoryStore` and `GraphContextProvider`, avoiding a second ~500 MB load.
     pub async fn new(config: Config) -> Result<Self, AiAssistantError> {
-        let embedding_memory = OnnxEmbedding::new(&config.embedding_model_path)?;
-        let embedding_graph = Arc::new(OnnxEmbedding::new(&config.embedding_model_path)?);
+        let embedding = Arc::new(OnnxEmbedding::new(&config.embedding_model_path)?);
 
-        let memory = MemoryStore::new(embedding_memory)?;
-        let graph = GraphContextProvider::new(embedding_graph)?;
+        let memory = MemoryStore::new_with_arc(Arc::clone(&embedding))?;
+        let graph = GraphContextProvider::new(Arc::clone(&embedding))?;
         let coherence = CoherenceChecker::new()?;
         let claude = ClaudeClient::new();
         let mcp = McpToolManager::load("mcp_servers.json")?;
@@ -337,8 +336,19 @@ impl Pipeline {
                 "content": prompt.full_content()
             })];
 
-            // Add assistant's tool-call message
-            let assistant_content = serde_json::to_string(&response)?;
+            // Build assistant content array from tool calls (Anthropic API format)
+            let assistant_content: Vec<serde_json::Value> = response
+                .tool_calls
+                .iter()
+                .map(|tc| {
+                    serde_json::json!({
+                        "type": "tool_use",
+                        "id": tc.id,
+                        "name": tc.name,
+                        "input": tc.input
+                    })
+                })
+                .collect();
             messages.push(serde_json::json!({
                 "role": "assistant",
                 "content": assistant_content
