@@ -1,0 +1,51 @@
+[package]
+name = "ai-assistant"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "ai_assistant"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ai-assistant"
+path = "src/main.rs"
+
+[dependencies]
+ruvector-core                = { path = "./ruvector/crates/ruvector-core" }
+ruvector-sona                = { path = "./ruvector/crates/sona" }
+ruvector-graph               = { path = "./ruvector/crates/ruvector-graph" }
+prime-radiant                = { path = "./ruvector/crates/prime-radiant" }
+ruvector-verified            = { path = "./ruvector/crates/ruvector-verified" }
+ruvector-cognitive-container = { path = "./ruvector/crates/ruvector-cognitive-container" }
+ruvector-math                = { path = "./ruvector/crates/ruvector-math" }
+ruvector-solver              = { path = "./ruvector/crates/ruvector-solver" }
+ruvector-mincut              = { path = "./ruvector/crates/ruvector-mincut" }
+ruvector-temporal-tensor     = { path = "./ruvector/crates/ruvector-temporal-tensor" }
+rvf-runtime                  = { path = "./ruvector/crates/rvf/rvf-runtime" }
+rvf-crypto                   = { path = "./ruvector/crates/rvf/rvf-crypto" }
+reqwest    = { version = "0.11", features = ["json"] }
+tokio      = { version = "1", features = ["full"] }
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+dotenvy    = "0.15"
+thiserror  = "1"
+sha3       = "0.10"
+hex        = "0.4"
+uuid       = { version = "1", features = ["v4"] }
+chrono     = { version = "0.4", features = ["serde"] }
+tracing    = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+default = []
+onnx    = ["dep:ort", "dep:ndarray"]
+
+[dependencies.ort]
+version  = "2.0.0-rc.9"
+features = ["load-dynamic"]
+optional = true
+
+[dependencies.ndarray]
+version  = "0.16"
+optional = true

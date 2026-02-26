@@ -1,0 +1,27 @@
+# Build artifacts
+/target
+
+# Environment secrets
+.env
+
+# ONNX model files (large binaries)
+/models/
+*.onnx
+
+# Runtime database (AgenticDB)
+/data/
+
+# IDE / Roo-specific config
+.roo/
+.roomodes
+
+# OS artifacts
+Thumbs.db
+.DS_Store
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
