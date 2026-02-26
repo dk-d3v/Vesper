@@ -319,19 +319,24 @@ impl Pipeline {
     ) -> Result<FinalPrompt, AiAssistantError> {
         let system = load_system_prompt(&msg.language);
 
-        let mut context_parts: Vec<String> = Vec::new();
-        for ep in &semantic.episodes {
-            context_parts.push(ep.text.clone());
-        }
-        if !graph.rag_content.is_empty() {
-            context_parts.push(graph.rag_content.clone());
-        }
+        // Memory episodes → system <memory> block for cross-session recall.
+        // Claude interprets these as long-term memories, not current context.
+        let memory_context = semantic
+            .episodes
+            .iter()
+            .map(|ep| ep.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n---\n");
 
-        let context = context_parts.join("\n---\n");
-        let estimated_tokens =
-            context.len() / 4 + msg.text.len() / 4 + system.len() / 4;
+        // Graph RAG → user message context section (current-session knowledge).
+        let context = graph.rag_content.clone();
 
-        // Trim if over token limit — use MinCut-based smart trimming
+        let estimated_tokens = memory_context.len() / 4
+            + context.len() / 4
+            + msg.text.len() / 4
+            + system.len() / 4;
+
+        // Trim graph RAG if over token limit — use MinCut-based smart trimming
         let context = if estimated_tokens > MAX_TOKENS {
             smart_context_trim(&context, MAX_TOKENS * 4)
         } else {
@@ -340,6 +345,7 @@ impl Pipeline {
 
         Ok(FinalPrompt {
             system,
+            memory_context,
             context,
             user_text: msg.text.clone(),
             estimated_tokens,
@@ -376,7 +382,7 @@ impl Pipeline {
         self.claude
             .send_message_stream(
                 &self.config,
-                &prompt.system,
+                &prompt.system_with_memory(),
                 &prompt.full_content(),
                 tools,
                 on_token,
@@ -397,7 +403,7 @@ impl Pipeline {
             .claude
             .send_message(
                 &self.config,
-                &prompt.system,
+                &prompt.system_with_memory(),
                 &prompt.full_content(),
                 tools,
             )
@@ -452,7 +458,7 @@ impl Pipeline {
             // Re-call Claude with tool results
             response = self
                 .claude
-                .send_with_tool_results(&self.config, &prompt.system, &messages, tools)
+                .send_with_tool_results(&self.config, &prompt.system_with_memory(), &messages, tools)
                 .await?;
         }
 

@@ -100,13 +100,34 @@ pub struct GraphContext {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FinalPrompt {
     pub system: String,
+    /// Cross-session memory episodes — injected into the *system* prompt
+    /// under a `<memory>` tag so Claude can reference them as long-term recall.
+    pub memory_context: String,
+    /// Current-session graph-RAG content — injected into the *user* message.
     pub context: String,
     pub user_text: String,
     pub estimated_tokens: usize,
 }
 
 impl FinalPrompt {
-    /// Returns the combined context + user text for the `user` role message.
+    /// Returns the system prompt with the optional `<memory>` block appended.
+    ///
+    /// The `<memory>` block is placed *after* all system instructions so that
+    /// Claude reads the behavioural rules first, then the factual memories.
+    pub fn system_with_memory(&self) -> String {
+        if self.memory_context.is_empty() {
+            self.system.clone()
+        } else {
+            format!(
+                "{}\n\n<memory>\n{}\n</memory>",
+                self.system, self.memory_context
+            )
+        }
+    }
+
+    /// Returns the combined graph-RAG context + user text for the `user` role message.
+    ///
+    /// Memory episodes are **not** included here — they live in the system prompt.
     pub fn full_content(&self) -> String {
         if self.context.is_empty() {
             self.user_text.clone()
