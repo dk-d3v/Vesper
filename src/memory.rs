@@ -31,8 +31,9 @@ use std::{
     collections::HashMap,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
+    thread,
 };
-use tracing::{info, warn};
+use tracing::{info, warn, error};
 use uuid::Uuid;
 
 // ── Fallback episode record ───────────────────────────────────────────────────
@@ -110,17 +111,60 @@ impl MemoryStore {
             ..DbOptions::default()
         };
 
-        let backend = match AgenticDB::with_embedding_provider(options, provider) {
-            Ok(db) => {
-                info!("AgenticDB initialised with OnnxEmbedding provider");
-                MemoryBackend::Agentic(db)
+        // Retry up to 3 times with 500 ms backoff.
+        // "Database already open" means a previous instance still holds the
+        // redb OS-level exclusive lock — retrying covers clean-shutdown races.
+        const MAX_TRIES: u8 = 3;
+        let backend = {
+            let mut last_err = None;
+            let mut result = None;
+            for attempt in 1..=MAX_TRIES {
+                match AgenticDB::with_embedding_provider(options.clone(), provider.clone()) {
+                    Ok(db) => {
+                        info!("AgenticDB initialised with OnnxEmbedding provider (attempt {})", attempt);
+                        result = Some(MemoryBackend::Agentic(db));
+                        break;
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if msg.contains("already open") || msg.contains("Cannot acquire lock") {
+                            error!(
+                                "AgenticDB lock conflict (attempt {}/{}): {} — \
+                                 is another instance of ai-assistant already running? \
+                                 Close it and restart.",
+                                attempt, MAX_TRIES, msg
+                            );
+                            if attempt < MAX_TRIES {
+                                thread::sleep(Duration::from_millis(500));
+                            }
+                            last_err = Some(e);
+                        } else {
+                            warn!(
+                                "AgenticDB init failed ({}); falling back to in-memory store",
+                                e
+                            );
+                            last_err = Some(e);
+                            break;
+                        }
+                    }
+                }
             }
-            Err(e) => {
-                warn!(
-                    "AgenticDB init failed ({}); falling back to in-memory store",
-                    e
-                );
-                MemoryBackend::InMemory(Vec::new())
+            match result {
+                Some(b) => b,
+                None => {
+                    if let Some(e) = last_err {
+                        let msg = e.to_string();
+                        if msg.contains("already open") || msg.contains("Cannot acquire lock") {
+                            error!(
+                                "AgenticDB still locked after {} attempts — falling back to \
+                                 in-memory store. Memory will NOT persist this session. \
+                                 Ensure no other instance is running, then restart.",
+                                MAX_TRIES
+                            );
+                        }
+                    }
+                    MemoryBackend::InMemory(Vec::new())
+                }
             }
         };
 
@@ -152,17 +196,56 @@ impl MemoryStore {
             ..DbOptions::default()
         };
 
-        let backend = match AgenticDB::with_embedding_provider(options, provider) {
-            Ok(db) => {
-                info!("AgenticDB initialised with OnnxEmbedding provider");
-                MemoryBackend::Agentic(db)
+        // Retry up to 3 times with 500 ms backoff (same as new_with_arc).
+        const MAX_TRIES: u8 = 3;
+        let backend = {
+            let mut last_err = None;
+            let mut result = None;
+            for attempt in 1..=MAX_TRIES {
+                match AgenticDB::with_embedding_provider(options.clone(), provider.clone()) {
+                    Ok(db) => {
+                        info!("AgenticDB initialised with OnnxEmbedding provider (attempt {})", attempt);
+                        result = Some(MemoryBackend::Agentic(db));
+                        break;
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if msg.contains("already open") || msg.contains("Cannot acquire lock") {
+                            error!(
+                                "AgenticDB lock conflict (attempt {}/{}): {} — \
+                                 is another instance of ai-assistant already running?",
+                                attempt, MAX_TRIES, msg
+                            );
+                            if attempt < MAX_TRIES {
+                                thread::sleep(Duration::from_millis(500));
+                            }
+                            last_err = Some(e);
+                        } else {
+                            warn!(
+                                "AgenticDB init failed ({}); falling back to in-memory store",
+                                e
+                            );
+                            last_err = Some(e);
+                            break;
+                        }
+                    }
+                }
             }
-            Err(e) => {
-                warn!(
-                    "AgenticDB init failed ({}); falling back to in-memory store",
-                    e
-                );
-                MemoryBackend::InMemory(Vec::new())
+            match result {
+                Some(b) => b,
+                None => {
+                    if let Some(e) = last_err {
+                        let msg = e.to_string();
+                        if msg.contains("already open") || msg.contains("Cannot acquire lock") {
+                            error!(
+                                "AgenticDB still locked after {} attempts — falling back to \
+                                 in-memory store. Memory will NOT persist this session.",
+                                MAX_TRIES
+                            );
+                        }
+                    }
+                    MemoryBackend::InMemory(Vec::new())
+                }
             }
         };
 
