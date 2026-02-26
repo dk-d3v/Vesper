@@ -512,10 +512,41 @@ impl Pipeline {
 
         match result {
             Ok(r) => {
-                // Periodically run explicit pattern extraction
+                // Log success — her turda quality ve trajectory bilgisini kaydet
+                tracing::info!(
+                    trajectory_id = %r.trajectory_id,
+                    quality_score = r.quality_score,
+                    pattern_count = r.pattern_count,
+                    "step8_learning_ok"
+                );
+
+                // Loop B: Background analysis — her 5 turda bir çalıştır
+                // (ruvllm Loop B karşılığı: K-means++ yerine streak/cluster detection)
+                let traj_num: u64 = r.trajectory_id
+                    .trim_start_matches("traj-")
+                    .parse()
+                    .unwrap_or(0);
+                if traj_num % 5 == 0 && traj_num > 0 {
+                    let patterns = self.learning.run_background_analysis();
+                    tracing::info!(
+                        patterns_detected = patterns,
+                        "step8_background_analysis"
+                    );
+                }
+
+                // Periodically run explicit SONA pattern extraction
                 if r.trajectory_id.ends_with('0') {
                     let _ = self.learning.find_patterns();
                 }
+
+                // Quality trend — log eğimi (adaptive feedback için gelecekte kullanılabilir)
+                if let Some(trend) = self.learning.quality_trend() {
+                    tracing::info!(
+                        quality_trend_slope = trend,
+                        "step8_quality_trend"
+                    );
+                }
+
                 Ok(r)
             }
             Err(e) => {
