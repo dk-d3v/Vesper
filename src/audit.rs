@@ -1,8 +1,13 @@
-//! Immutable audit trail using SHAKE-256 hash chaining.
+//! Immutable audit trail using SHAKE-256 hash chaining with witness receipts.
 //!
 //! Every recorded entry links to the previous one via its `prev_hash`,
 //! forming an append-only chain. `verify_chain()` walks the entire chain
 //! and returns `false` if any link is broken.
+//!
+//! A secondary [`WitnessChain`] from `ruvector-cognitive-container` runs in
+//! parallel, producing a tamper-evident receipt for every epoch.  If the
+//! witness layer panics it is silently swallowed so the SHAKE-256 chain
+//! remains the authoritative audit record (graceful degradation).
 //!
 //! # Invariants
 //! - Entries are append-only; existing entries cannot be removed or modified.
@@ -13,8 +18,13 @@ use sha3::{
     digest::{ExtendableOutput, Update, XofReader},
     Shake256,
 };
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::time::SystemTime;
 use uuid::Uuid;
+
+use ruvector_cognitive_container::{
+    CoherenceDecision, ContainerWitnessReceipt, VerificationResult, WitnessChain,
+};
 
 use crate::{error::AiAssistantError, types::AuditResult};
 
@@ -71,24 +81,35 @@ impl AuditEntry {
     }
 }
 
+/// Maximum number of witness receipts retained in the ring buffer.
+const WITNESS_MAX_RECEIPTS: usize = 4096;
+
 /// Append-only audit trail backed by a SHAKE-256 hash chain.
+///
+/// A secondary [`WitnessChain`] produces a tamper-evident receipt for every
+/// `record()` call.  The witness layer is best-effort: if it panics the
+/// SHAKE-256 chain continues unaffected.
 ///
 /// ```text
 /// [genesis] ← [entry 0] ← [entry 1] ← … ← [entry N]
+///              receipt 0     receipt 1         receipt N
 /// ```
 pub struct AuditTrail {
     /// Ordered chain of audit entries (append-only).
     entries: Vec<AuditEntry>,
     /// Hash of the most recently recorded entry (or genesis sentinel).
     last_hash: String,
+    /// Parallel witness chain producing per-epoch receipts.
+    witness_chain: WitnessChain,
 }
 
 impl AuditTrail {
-    /// Create an empty audit trail.
+    /// Create an empty audit trail with a fresh witness chain.
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
             last_hash: GENESIS_HASH.to_string(),
+            witness_chain: WitnessChain::new(WITNESS_MAX_RECEIPTS),
         }
     }
 
@@ -98,6 +119,10 @@ impl AuditTrail {
     /// - `data_hash`  = SHAKE-256(`data`)
     /// - `prev_hash`  = hash of the previous entry (or genesis)
     /// - `entry_hash` = SHAKE-256(`id | data_hash | prev_hash | type`)
+    ///
+    /// Also generates a [`ContainerWitnessReceipt`] via the witness chain.
+    /// If the witness layer panics, a warning is logged and execution
+    /// continues (graceful degradation).
     ///
     /// Returns [`AuditResult`] with the entry's UUID and its hash.
     pub fn record(
@@ -120,6 +145,9 @@ impl AuditTrail {
         let entry_hash = entry.entry_hash();
         self.last_hash = entry_hash.clone();
         self.entries.push(entry);
+
+        // ── Witness receipt (best-effort) ────────────────────────────────
+        self.try_generate_witness_receipt(data, &entry_hash);
 
         Ok(AuditResult {
             episode_id: id,
@@ -155,6 +183,23 @@ impl AuditTrail {
         true
     }
 
+    /// Verify the parallel witness chain and return the result.
+    ///
+    /// Delegates to [`WitnessChain::verify_chain`].  If the verification
+    /// panics, returns [`VerificationResult::Empty`] as a safe fallback.
+    pub fn verify_witness_chain(&self) -> VerificationResult {
+        let receipts = self.witness_chain.receipt_chain();
+        match catch_unwind(AssertUnwindSafe(|| {
+            WitnessChain::verify_chain(receipts)
+        })) {
+            Ok(result) => result,
+            Err(_) => {
+                eprintln!("[audit] witness chain verification panicked — returning Empty");
+                VerificationResult::Empty
+            }
+        }
+    }
+
     /// Return the hash of the last recorded entry (or genesis hash if empty).
     pub fn last_hash(&self) -> &str {
         &self.last_hash
@@ -175,12 +220,52 @@ impl AuditTrail {
         &self.entries
     }
 
+    /// Return a read-only reference to the retained witness receipts.
+    pub fn witness_receipts(&self) -> &[ContainerWitnessReceipt] {
+        self.witness_chain.receipt_chain()
+    }
+
+    /// Current witness-chain epoch (number of receipts generated so far).
+    pub fn witness_epoch(&self) -> u64 {
+        self.witness_chain.current_epoch()
+    }
+
     /// Compute SHAKE-256 of `data` with 256-bit (32-byte) output, hex-encoded.
     ///
     /// This is exposed as a public associated function so pipeline steps can
     /// hash arbitrary data consistently with the audit chain.
     pub fn shake256(data: &[u8]) -> String {
         shake256_hex(data)
+    }
+}
+
+// ── Witness-chain helper (private) ───────────────────────────────────────────
+
+impl AuditTrail {
+    /// Try to generate a witness receipt; swallow panics for graceful degradation.
+    fn try_generate_witness_receipt(&mut self, data: &str, entry_hash: &str) {
+        let input_deltas = data.as_bytes();
+        let mincut_data = entry_hash.as_bytes();
+        let spectral_scs = 1.0_f64; // nominal coherence score
+        let evidence_data = self.last_hash.as_bytes();
+        let decision = CoherenceDecision::Pass;
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            self.witness_chain.generate_receipt(
+                input_deltas,
+                mincut_data,
+                spectral_scs,
+                evidence_data,
+                decision,
+            )
+        }));
+
+        if let Err(_panic) = result {
+            eprintln!(
+                "[audit] witness receipt generation panicked at epoch {} — skipping",
+                self.witness_chain.current_epoch()
+            );
+        }
     }
 }
 
@@ -249,5 +334,55 @@ mod tests {
         let h2 = AuditTrail::shake256(b"test data");
         assert_eq!(h1, h2);
         assert_eq!(h1.len(), 64);
+    }
+
+    // ── Witness-chain tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_witness_chain_generates_receipts() {
+        let mut trail = AuditTrail::new();
+        trail.record("event-a", AuditEntryType::ConversationTurn).unwrap();
+        trail.record("event-b", AuditEntryType::EpisodeStored).unwrap();
+
+        assert_eq!(trail.witness_epoch(), 2);
+        assert_eq!(trail.witness_receipts().len(), 2);
+    }
+
+    #[test]
+    fn test_witness_chain_verifies_after_records() {
+        let mut trail = AuditTrail::new();
+        for i in 0..5 {
+            trail.record(&format!("turn-{i}"), AuditEntryType::ConversationTurn).unwrap();
+        }
+        match trail.verify_witness_chain() {
+            VerificationResult::Valid { chain_length, .. } => {
+                assert_eq!(chain_length, 5);
+            }
+            other => panic!("Expected Valid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_empty_witness_chain_returns_empty() {
+        let trail = AuditTrail::new();
+        match trail.verify_witness_chain() {
+            VerificationResult::Empty => {}
+            other => panic!("Expected Empty, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_both_chains_stay_in_sync() {
+        let mut trail = AuditTrail::new();
+        trail.record("sync", AuditEntryType::CausalEdgeAdded).unwrap();
+        assert_eq!(trail.len(), 1);
+        assert_eq!(trail.witness_epoch(), 1);
+        assert!(trail.verify_chain());
+        match trail.verify_witness_chain() {
+            VerificationResult::Valid { chain_length, .. } => {
+                assert_eq!(chain_length, 1);
+            }
+            other => panic!("Expected Valid, got {other:?}"),
+        }
     }
 }

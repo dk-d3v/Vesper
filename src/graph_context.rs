@@ -4,8 +4,16 @@
 //! builds a lightweight RAG layer on top of it using [`SemanticSearch`] +
 //! [`RagEngine`].
 //!
+//! # Integrations
+//! - **ruvector-solver** (PageRank): ranks document nodes by importance using
+//!   `ForwardPushSolver` for sublinear PPR computation.
+//! - **ruvector-mincut** (topic clustering): identifies topic clusters and
+//!   removes irrelevant subgraphs via `MinCutBuilder` / `DynamicMinCut`.
+//!
 //! # Graceful degradation
 //! - If the graph is empty → returns empty [`GraphContext`] (pipeline continues).
+//! - If PageRank fails → documents are returned in retrieval order.
+//! - If MinCut fails → all documents are kept (no pruning).
 //! - Any intermediate error is logged with `tracing::warn!` and skipped.
 
 use crate::{
@@ -18,6 +26,9 @@ use ruvector_graph::{
     GraphDB, NodeBuilder,
     types::PropertyValue,
 };
+use ruvector_mincut::{MinCutBuilder, DynamicMinCut};
+use ruvector_solver::forward_push::ForwardPushSolver;
+use ruvector_solver::types::CsrMatrix;
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -87,7 +98,9 @@ impl GraphContextProvider {
     /// Steps:
     /// 1. Cypher-style entity lookup (label-based).
     /// 2. RAG multi-hop retrieval (up to [`RAG_MAX_HOPS`] hops).
-    /// 3. Causal edge retrieval matching the query.
+    /// 3. PageRank ranking of retrieved documents.
+    /// 4. MinCut topic clustering to remove irrelevant subgraphs.
+    /// 5. Causal edge retrieval matching the query.
     ///
     /// Returns empty context if the graph has no nodes.
     pub fn get_context(&self, query: &str) -> Result<GraphContext, AiAssistantError> {
@@ -107,7 +120,13 @@ impl GraphContextProvider {
                 String::new()
             });
 
-        // Step 3: causal edges
+        // Step 3: PageRank ranking of document chunks
+        let ranked_content = self.apply_pagerank_ranking(&rag_content);
+
+        // Step 4: MinCut topic clustering to prune irrelevant subgraphs
+        let pruned_content = self.apply_mincut_pruning(&ranked_content, query);
+
+        // Step 5: causal edges
         let query_lower = query.to_lowercase();
         let causal_edges: Vec<(String, String)> = self
             .causal_edges
@@ -120,10 +139,223 @@ impl GraphContextProvider {
             .collect();
 
         Ok(GraphContext {
-            rag_content,
+            rag_content: pruned_content,
             entity_count,
             causal_edges,
         })
+    }
+
+    // ── PageRank integration (ruvector-solver) ────────────────────────────────
+
+    /// Build a CSR adjacency matrix from document chunks and run PageRank to
+    /// re-sort them by importance (higher PageRank = earlier in output).
+    ///
+    /// Each chunk becomes a graph node; edges are formed between chunks that
+    /// share significant word overlap (proxy for semantic similarity).
+    ///
+    /// **Graceful degradation**: returns `rag_content` unchanged on failure.
+    fn apply_pagerank_ranking(&self, rag_content: &str) -> String {
+        if rag_content.is_empty() {
+            return String::new();
+        }
+
+        let chunks: Vec<&str> = rag_content.split("\n---\n").collect();
+        if chunks.len() < 2 {
+            return rag_content.to_string();
+        }
+
+        match self.pagerank_rank_chunks(&chunks) {
+            Ok(ranked) => ranked,
+            Err(e) => {
+                warn!("PageRank ranking failed (falling back to retrieval order): {}", e);
+                rag_content.to_string()
+            }
+        }
+    }
+
+    /// Core PageRank computation over document chunks.
+    fn pagerank_rank_chunks(&self, chunks: &[&str]) -> Result<String, String> {
+        let n = chunks.len();
+        if n == 0 {
+            return Ok(String::new());
+        }
+
+        // Build adjacency edges based on word overlap between chunks
+        let word_sets: Vec<std::collections::HashSet<&str>> = chunks
+            .iter()
+            .map(|chunk| {
+                chunk.split_whitespace()
+                    .filter(|w| w.len() > 3)
+                    .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
+                    .collect()
+            })
+            .collect();
+
+        let mut coo_entries: Vec<(usize, usize, f64)> = Vec::new();
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let overlap = word_sets[i].intersection(&word_sets[j]).count();
+                let max_len = word_sets[i].len().max(word_sets[j].len()).max(1);
+                let similarity = overlap as f64 / max_len as f64;
+
+                // Create bidirectional edge if overlap is significant
+                if similarity > 0.1 {
+                    coo_entries.push((i, j, similarity));
+                    coo_entries.push((j, i, similarity));
+                }
+            }
+        }
+
+        // If no edges, return original order
+        if coo_entries.is_empty() {
+            return Ok(chunks.join("\n---\n"));
+        }
+
+        let graph = CsrMatrix::<f64>::from_coo(n, n, coo_entries);
+        let solver = ForwardPushSolver::new(0.85, 1e-4);
+
+        // Run PPR from node 0 (first chunk, closest to the query)
+        let ppr_scores = solver
+            .ppr_from_source(&graph, 0)
+            .map_err(|e| format!("ForwardPushSolver PPR failed: {}", e))?;
+
+        // Build score map (node_index → score)
+        let mut scores = vec![0.0f64; n];
+        for &(idx, score) in &ppr_scores {
+            if idx < n {
+                scores[idx] = score;
+            }
+        }
+
+        // Sort chunk indices by PageRank score (descending)
+        let mut indices: Vec<usize> = (0..n).collect();
+        indices.sort_by(|&a, &b| {
+            scores[b]
+                .partial_cmp(&scores[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Reassemble chunks in ranked order
+        let ranked: Vec<&str> = indices.iter().map(|&i| chunks[i]).collect();
+        Ok(ranked.join("\n---\n"))
+    }
+
+    // ── MinCut integration (ruvector-mincut) ──────────────────────────────────
+
+    /// Use MinCut to identify topic clusters in the document graph and remove
+    /// chunks that are disconnected from the query-relevant subgraph.
+    ///
+    /// **Graceful degradation**: returns `content` unchanged on failure.
+    fn apply_mincut_pruning(&self, content: &str, query: &str) -> String {
+        if content.is_empty() {
+            return String::new();
+        }
+
+        let chunks: Vec<&str> = content.split("\n---\n").collect();
+        if chunks.len() < 3 {
+            // Too few chunks to benefit from pruning
+            return content.to_string();
+        }
+
+        match self.mincut_prune_chunks(&chunks, query) {
+            Ok(pruned) => pruned,
+            Err(e) => {
+                warn!("MinCut pruning failed (keeping all documents): {}", e);
+                content.to_string()
+            }
+        }
+    }
+
+    /// Core MinCut-based pruning: builds a weighted graph of chunk similarity
+    /// and uses MinCut to find the partition. Chunks in the same partition as
+    /// the query-relevant chunk (node 0) are kept; others are removed.
+    fn mincut_prune_chunks(&self, chunks: &[&str], query: &str) -> Result<String, String> {
+        let n = chunks.len();
+
+        // Find the chunk most relevant to the query
+        let query_lower = query.to_lowercase();
+        let query_node = chunks
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, chunk)| {
+                let chunk_lower = chunk.to_lowercase();
+                query_lower
+                    .split_whitespace()
+                    .filter(|w| w.len() > 3 && chunk_lower.contains(w))
+                    .count()
+            })
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+
+        // Build MinCut graph edges based on word overlap
+        let word_sets: Vec<std::collections::HashSet<String>> = chunks
+            .iter()
+            .map(|chunk| {
+                chunk
+                    .split_whitespace()
+                    .filter(|w| w.len() > 3)
+                    .map(|w| w.to_lowercase())
+                    .collect()
+            })
+            .collect();
+
+        let mut edges: Vec<(u64, u64, f64)> = Vec::new();
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let overlap = word_sets[i].intersection(&word_sets[j]).count();
+                let max_len = word_sets[i].len().max(word_sets[j].len()).max(1);
+                let weight = overlap as f64 / max_len as f64;
+
+                if weight > 0.05 {
+                    edges.push((i as u64, j as u64, weight));
+                }
+            }
+        }
+
+        if edges.is_empty() {
+            // No edges means no pruning can be done
+            return Ok(chunks.join("\n---\n"));
+        }
+
+        // Build MinCut structure
+        let mincut = MinCutBuilder::new()
+            .exact()
+            .with_edges(edges)
+            .build()
+            .map_err(|e| format!("MinCut build failed: {}", e))?;
+
+        let result = mincut.min_cut();
+
+        // If graph is well-connected (high min-cut), keep all chunks
+        if result.value > 0.5 {
+            return Ok(chunks.join("\n---\n"));
+        }
+
+        // Use partition info to keep chunks in the same partition as query_node
+        if let Some((side_a, side_b)) = result.partition {
+            let query_side = if side_a.contains(&(query_node as u64)) {
+                &side_a
+            } else {
+                &side_b
+            };
+
+            let kept: Vec<&str> = chunks
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| query_side.contains(&(*i as u64)))
+                .map(|(_, chunk)| *chunk)
+                .collect();
+
+            if kept.is_empty() {
+                // Safety: never return empty if we had content
+                return Ok(chunks.join("\n---\n"));
+            }
+
+            Ok(kept.join("\n---\n"))
+        } else {
+            // No partition info available, keep everything
+            Ok(chunks.join("\n---\n"))
+        }
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────

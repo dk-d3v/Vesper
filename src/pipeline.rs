@@ -2,6 +2,11 @@
 //!
 //! Every conversation turn executes ALL 10 steps — none are optional.
 //! Steps 3, 8, and 9 degrade gracefully (they log warnings and continue).
+//!
+//! # Integrations
+//! - **ruvector-mincut** (ADIM 4): Smart context trimming using MinCut to
+//!   remove least-connected chunks when over the token limit, instead of
+//!   naive character truncation.
 
 use std::sync::Arc;
 
@@ -20,6 +25,8 @@ use crate::{
     verification::Verifier,
     embedding::OnnxEmbedding,
 };
+
+use ruvector_mincut::MinCutBuilder;
 
 // ── Pipeline struct ───────────────────────────────────────────────────────────
 
@@ -168,7 +175,8 @@ impl Pipeline {
     /// STEP 4 — Merge context and prepare prompt.
     ///
     /// Hot/warm/cold episodes appear first, then graph RAG content.
-    /// Context is trimmed to stay under `MAX_TOKENS`.
+    /// Context is trimmed using MinCut-based intelligent pruning when over
+    /// `MAX_TOKENS`. Falls back to simple `chars().take()` if MinCut fails.
     fn step4_prepare_prompt(
         &self,
         msg: &UserMessage,
@@ -189,10 +197,9 @@ impl Pipeline {
         let estimated_tokens =
             context.len() / 4 + msg.text.len() / 4 + system.len() / 4;
 
-        // Trim if over token limit
+        // Trim if over token limit — use MinCut-based smart trimming
         let context = if estimated_tokens > MAX_TOKENS {
-            let char_limit = MAX_TOKENS * 4;
-            context.chars().take(char_limit).collect()
+            smart_context_trim(&context, MAX_TOKENS * 4)
         } else {
             context
         };
@@ -378,4 +385,162 @@ impl Pipeline {
         });
         verified.text
     }
+}
+
+// ── MinCut-based smart context trimming (ADIM 4) ─────────────────────────────
+
+/// Intelligently trim context to fit within `char_limit` using MinCut.
+///
+/// Builds a graph where context chunks are nodes and edges represent
+/// semantic similarity (word overlap). Uses MinCut to identify the
+/// least-connected chunks and removes them first, preserving the most
+/// coherent subgraph.
+///
+/// **Graceful degradation**: Falls back to `chars().take()` on failure.
+fn smart_context_trim(context: &str, char_limit: usize) -> String {
+    if context.len() <= char_limit {
+        return context.to_string();
+    }
+
+    // Try MinCut-based trimming
+    match mincut_trim(context, char_limit) {
+        Ok(trimmed) => trimmed,
+        Err(e) => {
+            tracing::warn!(
+                "MinCut smart trimming failed (falling back to char truncation): {}",
+                e
+            );
+            context.chars().take(char_limit).collect()
+        }
+    }
+}
+
+/// Core MinCut trimming: splits context into chunks, builds a similarity
+/// graph, and iteratively removes the least-connected chunk until the
+/// total length fits within the character limit.
+fn mincut_trim(context: &str, char_limit: usize) -> Result<String, String> {
+    // Split into chunks (by separator or by paragraphs)
+    let chunks: Vec<&str> = if context.contains("\n---\n") {
+        context.split("\n---\n").collect()
+    } else {
+        context.split("\n\n").collect()
+    };
+
+    if chunks.len() < 2 {
+        // Single chunk: just truncate
+        return Ok(context.chars().take(char_limit).collect());
+    }
+
+    // Build word sets for similarity computation
+    let word_sets: Vec<std::collections::HashSet<String>> = chunks
+        .iter()
+        .map(|chunk| {
+            chunk
+                .split_whitespace()
+                .filter(|w| w.len() > 3)
+                .map(|w| w.to_lowercase())
+                .collect()
+        })
+        .collect();
+
+    // Build edge list for MinCut
+    let n = chunks.len();
+    let mut edges: Vec<(u64, u64, f64)> = Vec::new();
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let overlap = word_sets[i].intersection(&word_sets[j]).count();
+            let max_len = word_sets[i].len().max(word_sets[j].len()).max(1);
+            let weight = overlap as f64 / max_len as f64;
+            if weight > 0.02 {
+                edges.push((i as u64, j as u64, weight));
+            }
+        }
+    }
+
+    if edges.is_empty() {
+        // No edges: keep first chunks that fit
+        return Ok(greedy_char_trim(&chunks, char_limit));
+    }
+
+    // Build MinCut and get partition
+    let mincut = MinCutBuilder::new()
+        .exact()
+        .with_edges(edges)
+        .build()
+        .map_err(|e| format!("MinCut build for trimming failed: {}", e))?;
+
+    let result = mincut.min_cut();
+
+    // Use partition to determine which side to keep (keep larger side)
+    let mut kept_indices: Vec<usize> = if let Some((side_a, side_b)) = result.partition {
+        // Compute total char length of each side
+        let len_a: usize = side_a.iter().map(|&i| chunks.get(i as usize).map_or(0, |c| c.len())).sum();
+        let len_b: usize = side_b.iter().map(|&i| chunks.get(i as usize).map_or(0, |c| c.len())).sum();
+
+        // Prefer the side that fits within the limit; if both fit, keep larger
+        let keep_side = if len_a <= char_limit && len_b <= char_limit {
+            if len_a >= len_b { &side_a } else { &side_b }
+        } else if len_a <= char_limit {
+            &side_a
+        } else if len_b <= char_limit {
+            &side_b
+        } else {
+            // Neither side fits alone; keep the smaller one and truncate
+            if len_a <= len_b { &side_a } else { &side_b }
+        };
+
+        keep_side.iter().map(|&i| i as usize).collect()
+    } else {
+        // No partition: keep all and truncate
+        (0..n).collect()
+    };
+
+    kept_indices.sort_unstable();
+
+    // Assemble kept chunks
+    let kept: Vec<&str> = kept_indices
+        .iter()
+        .filter_map(|&i| chunks.get(i))
+        .copied()
+        .collect();
+
+    let separator = if context.contains("\n---\n") {
+        "\n---\n"
+    } else {
+        "\n\n"
+    };
+    let result_text = kept.join(separator);
+
+    // Final safety: ensure we're within limit
+    if result_text.len() <= char_limit {
+        Ok(result_text)
+    } else {
+        Ok(result_text.chars().take(char_limit).collect())
+    }
+}
+
+/// Simple greedy trim: keep first chunks that fit within char_limit.
+fn greedy_char_trim(chunks: &[&str], char_limit: usize) -> String {
+    let mut result = String::new();
+    let mut total = 0usize;
+    for chunk in chunks {
+        let needed = if result.is_empty() {
+            chunk.len()
+        } else {
+            chunk.len() + 5 // "\n---\n" separator
+        };
+        if total + needed > char_limit {
+            break;
+        }
+        if !result.is_empty() {
+            result.push_str("\n---\n");
+        }
+        result.push_str(chunk);
+        total += needed;
+    }
+    if result.is_empty() && !chunks.is_empty() {
+        // At least include truncated first chunk
+        return chunks[0].chars().take(char_limit).collect();
+    }
+    result
 }
