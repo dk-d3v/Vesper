@@ -102,7 +102,11 @@ impl MemoryStore {
 
         let options = DbOptions {
             dimensions: EMBEDDING_DIM,
-            storage_path: "./data/agenticdb.db".to_string(),
+            storage_path: crate::config::exe_dir()
+                .join("data")
+                .join("agenticdb.db")
+                .to_string_lossy()
+                .into_owned(),
             ..DbOptions::default()
         };
 
@@ -140,7 +144,11 @@ impl MemoryStore {
 
         let options = DbOptions {
             dimensions: EMBEDDING_DIM,
-            storage_path: "./data/agenticdb.db".to_string(),
+            storage_path: crate::config::exe_dir()
+                .join("data")
+                .join("agenticdb.db")
+                .to_string_lossy()
+                .into_owned(),
             ..DbOptions::default()
         };
 

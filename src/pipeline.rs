@@ -56,7 +56,8 @@ impl Pipeline {
         let graph = GraphContextProvider::new(Arc::clone(&embedding))?;
         let coherence = CoherenceChecker::new()?;
         let claude = ClaudeClient::new();
-        let mcp = McpToolManager::load("mcp_servers.json")?;
+        let mcp_path = crate::config::exe_dir().join("mcp_servers.json");
+        let mcp = McpToolManager::load(mcp_path.to_str().unwrap_or("mcp_servers.json"))?;
         let verifier = Verifier::new()?;
         let learning = LearningEngine::new()?;
         let audit = AuditTrail::new();

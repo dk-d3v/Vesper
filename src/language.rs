@@ -67,8 +67,9 @@ pub fn load_system_prompt(language: &Language) -> String {
         Language::English => "prompts/system_en.md",
         Language::Other(_) => "prompts/system_en.md",
     };
+    let path = crate::config::exe_dir().join(filename);
 
-    std::fs::read_to_string(filename).unwrap_or_else(|_| {
+    std::fs::read_to_string(&path).unwrap_or_else(|_| {
         "You are a helpful AI assistant. Respond clearly and accurately.".to_string()
     })
 }
