@@ -125,10 +125,12 @@ impl Pipeline {
         let verified = self.step7_security_check(claude_resp, &prompt)?;
 
         // Step 8 — SONA learning record (graceful degradation)
-        let _ = self.step8_learning(&msg, &prompt, &verified);
+        let quality = self.step8_learning(&msg, &prompt, &verified)
+            .map(|r| r.quality_score)
+            .unwrap_or(0.7);
 
         // Step 9 — AgenticDB update + RVF audit (graceful degradation)
-        let _ = self.step9_update_and_audit(&msg, &verified);
+        let _ = self.step9_update_and_audit(&msg, &verified, quality);
 
         // Step 10 — return verified response, update session
         Ok(self.step10_return(msg, verified))
@@ -174,10 +176,12 @@ impl Pipeline {
         let verified = self.step7_security_check(claude_resp, &prompt)?;
 
         // Step 8 — SONA learning record (graceful degradation)
-        let _ = self.step8_learning(&msg, &prompt, &verified);
+        let quality = self.step8_learning(&msg, &prompt, &verified)
+            .map(|r| r.quality_score)
+            .unwrap_or(0.7);
 
         // Step 9 — AgenticDB update + RVF audit (graceful degradation)
-        let _ = self.step9_update_and_audit(&msg, &verified);
+        let _ = self.step9_update_and_audit(&msg, &verified, quality);
 
         // Step 10 — return verified response, update session
         Ok(self.step10_return(msg, verified))
@@ -431,11 +435,12 @@ impl Pipeline {
         &mut self,
         msg: &UserMessage,
         verified: &VerifiedResponse,
+        quality_score: f32,
     ) -> Result<AuditResult, AiAssistantError> {
         // Store episode in memory
         let _episode_id = self
             .memory
-            .store_episode(&verified.text, 0.7)
+            .store_episode(&verified.text, quality_score)
             .unwrap_or_else(|e| {
                 tracing::warn!("Episode storage failed: {}", e);
                 "unknown".to_string()
