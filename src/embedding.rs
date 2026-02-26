@@ -1,8 +1,9 @@
 //! ONNX-based embedding provider for paraphrase-multilingual-MiniLM-L12-v2.
 //!
 //! When the `onnx` Cargo feature is enabled and the model file is present,
-//! runs real inference via `ort`. Otherwise falls back to a deterministic
-//! hash-based embedding that preserves the correct 384-dim interface.
+//! runs real inference via `ort` with real BPE tokenization via `tokenizers`.
+//! Otherwise falls back to a deterministic hash-based embedding that preserves
+//! the correct 384-dim interface.
 //!
 //! Implements [`ruvector_core::embeddings::EmbeddingProvider`].
 
@@ -17,10 +18,15 @@ const MAX_SEQ_LEN: usize = 128;
 enum EmbeddingBackend {
     /// Deterministic hash-based fallback — correct dimensions, no semantics.
     Hash,
-    /// Real ONNX inference via `ort`.
-    /// Session::run() requires &mut self, so we wrap in Mutex for interior mutability.
+    /// Real ONNX inference via `ort` + real BPE tokenization via `tokenizers`.
+    ///
+    /// Session::run() requires &mut self, so we wrap in Mutex for interior
+    /// mutability. Tokenizer is Send+Sync, stored behind Arc for cheap clone.
     #[cfg(feature = "onnx")]
-    Onnx(std::sync::Arc<std::sync::Mutex<ort::session::Session>>),
+    Onnx {
+        session: std::sync::Arc<std::sync::Mutex<ort::session::Session>>,
+        tokenizer: std::sync::Arc<tokenizers::Tokenizer>,
+    },
 }
 
 // ── Public struct ────────────────────────────────────────────────────────────
@@ -33,7 +39,7 @@ pub struct OnnxEmbedding {
     backend: EmbeddingBackend,
 }
 
-// Safety: Mutex<Session> is Send+Sync; Hash variant is trivially so.
+// Safety: Mutex<Session> is Send+Sync; Arc<Tokenizer> is Send+Sync; Hash is trivially so.
 unsafe impl Send for OnnxEmbedding {}
 unsafe impl Sync for OnnxEmbedding {}
 
@@ -54,23 +60,22 @@ impl OnnxEmbedding {
                 crate::config::exe_dir().join(p)
             }
         };
-        let model_path_str = resolved_path
-            .to_str()
-            .unwrap_or(model_path);
+        let model_path_str = resolved_path.to_str().unwrap_or(model_path);
 
         // Keep original string for display; use resolved for loading.
         let model_path_display = model_path.to_string();
 
         #[cfg(feature = "onnx")]
         {
-            match Self::try_load_onnx(model_path_str) {
-                Ok(session) => {
-                    tracing::info!("ONNX model loaded from '{}'", model_path);
+            match Self::try_load_onnx_and_tokenizer(model_path_str) {
+                Ok((session, tokenizer)) => {
+                    tracing::info!("ONNX model + tokenizer loaded from '{}'", model_path);
                     return Ok(Self {
                         model_path: model_path.to_string(),
-                        backend: EmbeddingBackend::Onnx(std::sync::Arc::new(
-                            std::sync::Mutex::new(session),
-                        )),
+                        backend: EmbeddingBackend::Onnx {
+                            session: std::sync::Arc::new(std::sync::Mutex::new(session)),
+                            tokenizer: std::sync::Arc::new(tokenizer),
+                        },
                     });
                 }
                 Err(e) => {
@@ -123,19 +128,37 @@ impl OnnxEmbedding {
         match &self.backend {
             EmbeddingBackend::Hash => Ok(Self::hash_embed(text)),
             #[cfg(feature = "onnx")]
-            EmbeddingBackend::Onnx(session) => Self::onnx_embed(session, text),
+            EmbeddingBackend::Onnx { session, tokenizer } => {
+                Self::onnx_embed(session, tokenizer, text)
+            }
         }
     }
 
     // ── ONNX inference (feature-gated) ───────────────────────────────────────
 
+    /// Load ONNX session and tokenizer from a model directory or .onnx file path.
+    ///
+    /// Expects:
+    ///   - `<model_dir>/onnx/model.onnx`   (or the literal .onnx path)
+    ///   - `<model_dir>/tokenizer.json`
     #[cfg(feature = "onnx")]
-    fn try_load_onnx(model_path: &str) -> Result<ort::session::Session, AiAssistantError> {
-        // model_path may be either:
-        //   (a) the full path to the .onnx file, or
-        //   (b) a model directory — in which case the canonical sub-path
-        //       "<model_path>/onnx/model.onnx" is tried automatically.
-        let resolved = {
+    fn try_load_onnx_and_tokenizer(
+        model_path: &str,
+    ) -> Result<(ort::session::Session, tokenizers::Tokenizer), AiAssistantError> {
+        let base_dir = {
+            let p = std::path::Path::new(model_path);
+            if p.is_dir() {
+                p.to_path_buf()
+            } else {
+                // model_path points to the .onnx file — parent is the model dir
+                p.parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+            }
+        };
+
+        // Resolve .onnx file path
+        let onnx_path = {
             let p = std::path::Path::new(model_path);
             if p.is_dir() {
                 p.join("onnx").join("model.onnx")
@@ -144,31 +167,72 @@ impl OnnxEmbedding {
             }
         };
 
-        if !resolved.exists() {
+        if !onnx_path.exists() {
             return Err(AiAssistantError::Embedding(format!(
                 "ONNX model file not found: {}",
-                resolved.display()
+                onnx_path.display()
             )));
         }
-        ort::session::Session::builder()
+
+        // Resolve tokenizer.json — always in the model base directory
+        let tokenizer_path = base_dir.join("tokenizer.json");
+        if !tokenizer_path.exists() {
+            return Err(AiAssistantError::Embedding(format!(
+                "tokenizer.json not found: {}",
+                tokenizer_path.display()
+            )));
+        }
+
+        // Load ONNX session
+        let session = ort::session::Session::builder()
             .map_err(|e| AiAssistantError::Embedding(format!("ort builder: {e}")))?
-            .commit_from_file(&resolved)
-            .map_err(|e| AiAssistantError::Embedding(format!("ort load: {e}")))
+            .commit_from_file(&onnx_path)
+            .map_err(|e| AiAssistantError::Embedding(format!("ort load: {e}")))?;
+
+        // Load HuggingFace tokenizer from tokenizer.json
+        let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+            .map_err(|e| AiAssistantError::Embedding(format!("tokenizer load: {e}")))?;
+
+        Ok((session, tokenizer))
     }
 
+    /// Run ONNX inference using real BPE tokenization.
+    ///
+    /// Encodes `text` with the HuggingFace tokenizer, truncates to
+    /// `MAX_SEQ_LEN`, runs the ONNX model, mean-pools over non-padding
+    /// positions, and returns a normalised 384-dim embedding.
     #[cfg(feature = "onnx")]
     fn onnx_embed(
         session: &std::sync::Arc<std::sync::Mutex<ort::session::Session>>,
+        tokenizer: &std::sync::Arc<tokenizers::Tokenizer>,
         text: &str,
     ) -> Result<Vec<f32>, AiAssistantError> {
         use ndarray::Array2;
         use ort::value::Tensor;
 
-        let (input_ids, attention_mask) = Self::tokenize(text, MAX_SEQ_LEN);
-        let seq_len = input_ids.len();
+        // ── Real BPE tokenization ──────────────────────────────────────────
+        // Encode with special tokens (CLS + SEP added automatically by
+        // tokenizer.json configuration).
+        let encoding = tokenizer
+            .encode(text, true)
+            .map_err(|e| AiAssistantError::Embedding(format!("encode: {e}")))?;
+
+        // Truncate to MAX_SEQ_LEN (model limit)
+        let raw_ids = encoding.get_ids();
+        let raw_mask = encoding.get_attention_mask();
+        let seq_len = raw_ids.len().min(MAX_SEQ_LEN);
+
+        if seq_len == 0 {
+            return Err(AiAssistantError::Embedding(
+                "Tokenizer produced empty sequence".to_string(),
+            ));
+        }
+
+        let input_ids: Vec<i64> = raw_ids[..seq_len].iter().map(|&x| x as i64).collect();
+        let attention_mask: Vec<i64> = raw_mask[..seq_len].iter().map(|&x| x as i64).collect();
         let token_type_ids = vec![0i64; seq_len];
 
-        // Build ndarray Array2 tensors
+        // ── Build ndarray tensors ──────────────────────────────────────────
         let ids_arr = Array2::from_shape_vec((1, seq_len), input_ids)
             .map_err(|e| AiAssistantError::Embedding(e.to_string()))?;
         let mask_arr = Array2::from_shape_vec((1, seq_len), attention_mask.clone())
@@ -176,7 +240,6 @@ impl OnnxEmbedding {
         let types_arr = Array2::from_shape_vec((1, seq_len), token_type_ids)
             .map_err(|e| AiAssistantError::Embedding(e.to_string()))?;
 
-        // ort 2.0.0-rc.9: Tensor lives in ort::value module
         let ids_val = Tensor::from_array(ids_arr)
             .map_err(|e: ort::Error| AiAssistantError::Embedding(e.to_string()))?;
         let mask_val = Tensor::from_array(mask_arr)
@@ -184,12 +247,11 @@ impl OnnxEmbedding {
         let types_val = Tensor::from_array(types_arr)
             .map_err(|e: ort::Error| AiAssistantError::Embedding(e.to_string()))?;
 
-        // Lock the mutex to get &mut Session — Session::run() requires &mut self
-        let mut guard = session
+        // ── Run ONNX session ───────────────────────────────────────────────
+        let guard = session
             .lock()
             .map_err(|_| AiAssistantError::Embedding("Session mutex poisoned".to_string()))?;
 
-        // ort rc.9: ort::inputs! returns Result<Vec<...>> — unwrap with ? first
         let session_inputs = ort::inputs![
             "input_ids"      => ids_val,
             "attention_mask" => mask_val,
@@ -201,14 +263,14 @@ impl OnnxEmbedding {
             .run(session_inputs)
             .map_err(|e: ort::Error| AiAssistantError::Embedding(e.to_string()))?;
 
-        // ort rc.9: try_extract_tensor returns ArrayBase directly (not a tuple)
+        // ── Extract last_hidden_state → mean pool → normalize ──────────────
         let tensor = outputs["last_hidden_state"]
             .try_extract_tensor::<f32>()
             .map_err(|e: ort::Error| AiAssistantError::Embedding(e.to_string()))?;
 
         let flat: Vec<f32> = tensor.iter().copied().collect();
 
-        // Reshape to Vec<Vec<f32>> of shape [seq_len][384]
+        // Reshape to [seq_len][EMBEDDING_DIM]
         let mut token_embs: Vec<Vec<f32>> = Vec::with_capacity(seq_len);
         for i in 0..seq_len {
             let s = i * EMBEDDING_DIM;
@@ -225,43 +287,10 @@ impl OnnxEmbedding {
         Ok(Self::normalize(&pooled))
     }
 
-    // ── Tokenisation ─────────────────────────────────────────────────────────
-
-    /// Simple whitespace tokenisation.
-    ///
-    /// Maps each lowercased word to a deterministic token-ID in BERT vocab range
-    /// `[103, 30521]` using `DefaultHasher`. Wraps with `[CLS]`/`[SEP]` and pads
-    /// to `max_length` with `[PAD]`.
-    fn tokenize(text: &str, max_length: usize) -> (Vec<i64>, Vec<i64>) {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        // CLS=101, SEP=102, PAD=0
-        let mut input_ids: Vec<i64> = vec![101];
-        let mut attention_mask: Vec<i64> = vec![1];
-
-        for word in text.split_whitespace().take(max_length - 2) {
-            let mut h = DefaultHasher::new();
-            word.to_lowercase().hash(&mut h);
-            let token_id = (h.finish() % 30_419 + 103) as i64;
-            input_ids.push(token_id);
-            attention_mask.push(1);
-        }
-
-        input_ids.push(102); // [SEP]
-        attention_mask.push(1);
-
-        while input_ids.len() < max_length {
-            input_ids.push(0);
-            attention_mask.push(0);
-        }
-
-        (input_ids, attention_mask)
-    }
-
     // ── Pooling / normalisation ───────────────────────────────────────────────
 
     /// Mean pool token embeddings, masking out padded positions.
+    #[cfg(feature = "onnx")]
     fn mean_pool(token_embeddings: &[Vec<f32>], attention_mask: &[i64]) -> Vec<f32> {
         let dim = token_embeddings.first().map_or(EMBEDDING_DIM, |v| v.len());
         let mut sum = vec![0.0f32; dim];
@@ -282,7 +311,7 @@ impl OnnxEmbedding {
         sum
     }
 
-    /// L2-normalise a vector in place; returns `v` unchanged if norm < ε.
+    /// L2-normalise a vector; returns `v` unchanged if norm < ε.
     fn normalize(v: &[f32]) -> Vec<f32> {
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
         if norm > 1e-8 {
@@ -299,7 +328,7 @@ impl OnnxEmbedding {
     /// Uses an XOR-shift PRNG seeded per 48-element chunk to fill all 384
     /// dimensions, then L2-normalises the result.
     ///
-    /// ⚠️ NOT semantic — identical characters produce identical embeddings.
+    /// ⚠️ NOT semantic — different texts can produce similar or identical embeddings.
     fn hash_embed(text: &str) -> Vec<f32> {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
@@ -346,7 +375,7 @@ impl ruvector_core::embeddings::EmbeddingProvider for OnnxEmbedding {
         match &self.backend {
             EmbeddingBackend::Hash => "OnnxEmbedding (hash fallback — no real model)",
             #[cfg(feature = "onnx")]
-            EmbeddingBackend::Onnx(_) => {
+            EmbeddingBackend::Onnx { .. } => {
                 "OnnxEmbedding (paraphrase-multilingual-MiniLM-L12-v2)"
             }
         }
