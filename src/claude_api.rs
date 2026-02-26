@@ -412,17 +412,10 @@ fn process_sse_line<F>(
             }
         }
 
-        // Content block start — emit prefix markers for thinking/text blocks
+        // Content block start — thinking blocks are internal only; not forwarded
+        // to the user. Text blocks: the "Assistant: " label is printed in main.rs.
         Some("content_block_start") => {
-            let block_type = event
-                .pointer("/content_block/type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-
-            if block_type == "thinking" {
-                on_token("\n💭 Thinking: ");
-            }
-            // text blocks: the "Assistant: " label is already printed in main.rs
+            // Intentionally no on_token call for any block type here.
         }
 
         // Content block delta — handles text_delta, thinking_delta, signature_delta
@@ -440,12 +433,10 @@ fn process_sse_line<F>(
                     }
                 }
                 "thinking_delta" => {
-                    if let Some(thinking) = event
-                        .pointer("/delta/thinking")
-                        .and_then(|v| v.as_str())
-                    {
-                        on_token(thinking);
-                    }
+                    // Thinking tokens are processed internally only — never forwarded
+                    // to the user via on_token. The thinking content is discarded here
+                    // because coherence checks operate on the assembled full_text
+                    // (text_delta tokens only), not on the thinking stream.
                 }
                 "signature_delta" => {
                     // Verification signature — not displayed to the user
@@ -625,57 +616,52 @@ mod tests {
     }
 
     #[test]
-    fn sse_thinking_delta_calls_on_token() {
-        use std::cell::RefCell;
+    fn sse_thinking_delta_does_not_call_on_token() {
+        use std::cell::Cell;
 
         let line = r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"I am reasoning..."}}"#;
         let mut text = String::new();
         let mut model = String::new();
         let mut input = 0u32;
         let mut output = 0u32;
-        let tokens: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        let called = Cell::new(false);
 
         process_sse_line(
             line,
-            &|t: &str| tokens.borrow_mut().push(t.to_string()),
+            &|_| called.set(true),
             &mut text,
             &mut model,
             &mut input,
             &mut output,
         );
 
-        assert_eq!(*tokens.borrow(), vec!["I am reasoning..."]);
+        assert!(!called.get(), "thinking_delta must NOT call on_token (hidden from user)");
         // Thinking tokens do NOT contribute to full_text
         assert!(text.is_empty(), "thinking_delta should not update full_text");
     }
 
     #[test]
-    fn sse_content_block_start_thinking_emits_prefix() {
-        use std::cell::RefCell;
+    fn sse_content_block_start_thinking_does_not_emit_prefix() {
+        use std::cell::Cell;
 
         let line = r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#;
         let mut text = String::new();
         let mut model = String::new();
         let mut input = 0u32;
         let mut output = 0u32;
-        let tokens: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        let called = Cell::new(false);
 
         process_sse_line(
             line,
-            &|t: &str| tokens.borrow_mut().push(t.to_string()),
+            &|_| called.set(true),
             &mut text,
             &mut model,
             &mut input,
             &mut output,
         );
 
-        let emitted = tokens.borrow();
-        assert!(!emitted.is_empty(), "Should emit thinking prefix token");
-        assert!(
-            emitted[0].contains("💭"),
-            "Thinking prefix should contain 💭, got: {:?}",
-            emitted[0]
-        );
+        assert!(!called.get(), "content_block_start for thinking must NOT call on_token");
+        assert!(text.is_empty());
     }
 
     #[test]
@@ -725,6 +711,7 @@ mod tests {
             anthropic_base_url: "https://api.anthropic.com".to_string(),
             claude_model: "claude-opus-4-6".to_string(),
             embedding_model_path: "./models/test".to_string(),
+            ner_model_path: "./models/ner-test".to_string(),
             thinking_budget_tokens: budget,
             thinking_adaptive,
             thinking_effort: effort.map(|s| s.to_string()),

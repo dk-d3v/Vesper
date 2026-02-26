@@ -33,7 +33,45 @@ use rvf_crypto::{
     WitnessEntry,
 };
 
-use crate::{error::AiAssistantError, types::AuditResult};
+use crate::{error::AiAssistantError, forensic::ForensicBundle, types::AuditResult};
+
+/// Per-turn latency breakdown for observability.
+///
+/// Mirrors the `ruvllm::WitnessLog::LatencyBreakdown` pattern but uses
+/// integer milliseconds and tracks each of the 9 pipeline steps.
+#[derive(Debug, Clone, Default)]
+pub struct LatencyBreakdown {
+    pub step1_receive_ms: u64,
+    pub step2_semantic_search_ms: u64,
+    pub step3_graph_context_ms: u64,
+    pub step4_prepare_prompt_ms: u64,
+    pub step5_coherence_ms: u64,
+    pub step6_claude_api_ms: u64,
+    pub step7_security_ms: u64,
+    pub step8_learning_ms: u64,
+    pub step9_audit_ms: u64,
+    pub total_ms: u64,
+}
+
+impl LatencyBreakdown {
+    /// Create a zeroed latency breakdown.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sum all step latencies into `total_ms`.
+    pub fn compute_total(&mut self) {
+        self.total_ms = self.step1_receive_ms
+            + self.step2_semantic_search_ms
+            + self.step3_graph_context_ms
+            + self.step4_prepare_prompt_ms
+            + self.step5_coherence_ms
+            + self.step6_claude_api_ms
+            + self.step7_security_ms
+            + self.step8_learning_ms
+            + self.step9_audit_ms;
+    }
+}
 
 /// Sentinel hash used as the `prev_hash` of the very first entry.
 const GENESIS_HASH: &str =
@@ -283,6 +321,95 @@ impl AuditTrail {
     pub fn rvf_witness_len(&self) -> usize {
         self.rvf_witness_entries.len()
     }
+
+    /// Record an event with an associated latency breakdown.
+    ///
+    /// This is a **non-breaking** additive overload: it delegates to the
+    /// existing `record()` and then emits a `tracing::info!` event so the
+    /// per-step timing data is captured in structured logs without modifying
+    /// any existing call sites.
+    ///
+    /// # Arguments
+    /// * `data`    — arbitrary audit payload (same as `record`)
+    /// * `entry_type` — semantic category of the event
+    /// * `latency` — step-level latency breakdown to log
+    pub fn record_with_latency(
+        &mut self,
+        data: &str,
+        entry_type: AuditEntryType,
+        latency: &LatencyBreakdown,
+    ) -> Result<AuditResult, AiAssistantError> {
+        let result = self.record(data, entry_type)?;
+        tracing::info!(
+            audit_id = %result.episode_id,
+            total_ms = latency.total_ms,
+            step1_receive_ms = latency.step1_receive_ms,
+            step2_semantic_search_ms = latency.step2_semantic_search_ms,
+            step3_graph_context_ms = latency.step3_graph_context_ms,
+            step4_prepare_prompt_ms = latency.step4_prepare_prompt_ms,
+            step5_coherence_ms = latency.step5_coherence_ms,
+            step6_claude_api_ms = latency.step6_claude_api_ms,
+            step7_security_ms = latency.step7_security_ms,
+            step8_learning_ms = latency.step8_learning_ms,
+            step9_audit_ms = latency.step9_audit_ms,
+            "latency_breakdown"
+        );
+        Ok(result)
+    }
+
+    /// Record multiple audit entries in a single call.
+    ///
+    /// Each tuple is `(data, entry_type_str, input_hash, output_hash)` — the
+    /// last two fields are included for future extensibility (currently
+    /// serialised into the `data` payload so the hash chain remains stable).
+    ///
+    /// Returns one `Result` per entry in the same order as the input slice.
+    pub fn record_batch(
+        &mut self,
+        entries: &[(String, String, String, bool)],
+    ) -> Vec<Result<AuditResult, AiAssistantError>> {
+        entries
+            .iter()
+            .map(|(data, type_label, extra, _verified)| {
+                let payload = format!("{}|{}|{}", data, type_label, extra);
+                let entry_type = match type_label.as_str() {
+                    "EpisodeStored"    => AuditEntryType::EpisodeStored,
+                    "CausalEdgeAdded"  => AuditEntryType::CausalEdgeAdded,
+                    "SecurityHalt"     => AuditEntryType::SecurityHalt,
+                    _                  => AuditEntryType::ConversationTurn,
+                };
+                self.record(&payload, entry_type)
+            })
+            .collect()
+    }
+    /// Collect current audit state into a [`ForensicBundle`] for replay or export.
+    ///
+    /// # Arguments
+    /// * `session_id`        — caller-supplied session identifier
+    /// * `latency`           — current latency breakdown snapshot
+    /// * `attestation_count` — number of proof attestations recorded
+    /// * `proof_tier`        — routing tier label (`"Standard"` / `"Enhanced"` / `"Critical"`)
+    /// * `coherence_score`   — coherence score at snapshot time (0.0 – 1.0)
+    /// * `quality_score`     — quality score at snapshot time (0.0 – 1.0)
+    pub fn build_forensic_bundle(
+        &self,
+        session_id: impl Into<String>,
+        latency: LatencyBreakdown,
+        attestation_count: usize,
+        proof_tier: impl Into<String>,
+        coherence_score: f32,
+        quality_score: f32,
+    ) -> ForensicBundle {
+        ForensicBundle::new(
+            session_id,
+            latency,
+            self.entries.clone(),
+            attestation_count,
+            proof_tier,
+            coherence_score,
+            quality_score,
+        )
+    }
 }
 
 // ── Witness-chain helper (private) ───────────────────────────────────────────
@@ -430,5 +557,105 @@ mod tests {
             }
             other => panic!("Expected Valid, got {other:?}"),
         }
+    }
+
+    // ── LatencyBreakdown tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_latency_breakdown_compute_total() {
+        let mut lb = LatencyBreakdown::new();
+        lb.step1_receive_ms = 5;
+        lb.step2_semantic_search_ms = 10;
+        lb.step3_graph_context_ms = 8;
+        lb.step4_prepare_prompt_ms = 3;
+        lb.step5_coherence_ms = 7;
+        lb.step6_claude_api_ms = 300;
+        lb.step7_security_ms = 4;
+        lb.step8_learning_ms = 6;
+        lb.step9_audit_ms = 2;
+        lb.compute_total();
+        assert_eq!(lb.total_ms, 345);
+    }
+
+    #[test]
+    fn test_latency_breakdown_default_zero() {
+        let lb = LatencyBreakdown::default();
+        assert_eq!(lb.total_ms, 0);
+        assert_eq!(lb.step6_claude_api_ms, 0);
+    }
+
+    // ── record_with_latency tests ────────────────────────────────────────
+
+    #[test]
+    fn test_record_with_latency_preserves_chain() {
+        let mut trail = AuditTrail::new();
+        let mut lb = LatencyBreakdown::new();
+        lb.step6_claude_api_ms = 150;
+        lb.compute_total();
+
+        let result = trail
+            .record_with_latency("latency-event", AuditEntryType::ConversationTurn, &lb)
+            .unwrap();
+
+        assert!(!result.hash.is_empty());
+        assert_eq!(trail.len(), 1);
+        assert!(trail.verify_chain());
+    }
+
+    #[test]
+    fn test_record_with_latency_non_breaking() {
+        // Ensures existing record() still works unchanged alongside new method
+        let mut trail = AuditTrail::new();
+        trail.record("before", AuditEntryType::EpisodeStored).unwrap();
+
+        let lb = LatencyBreakdown::new();
+        trail
+            .record_with_latency("with-latency", AuditEntryType::ConversationTurn, &lb)
+            .unwrap();
+
+        trail.record("after", AuditEntryType::CausalEdgeAdded).unwrap();
+
+        assert_eq!(trail.len(), 3);
+        assert!(trail.verify_chain());
+    }
+
+    // ── record_batch tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_record_batch_all_succeed() {
+        let mut trail = AuditTrail::new();
+        let entries = vec![
+            ("data-a".to_string(), "ConversationTurn".to_string(), "hash-a".to_string(), true),
+            ("data-b".to_string(), "EpisodeStored".to_string(), "hash-b".to_string(), true),
+            ("data-c".to_string(), "CausalEdgeAdded".to_string(), "hash-c".to_string(), false),
+        ];
+
+        let results = trail.record_batch(&entries);
+        assert_eq!(results.len(), 3);
+        for r in &results {
+            assert!(r.is_ok(), "batch entry failed: {:?}", r);
+        }
+        assert_eq!(trail.len(), 3);
+        assert!(trail.verify_chain());
+    }
+
+    #[test]
+    fn test_record_batch_security_halt_type() {
+        let mut trail = AuditTrail::new();
+        let entries = vec![
+            ("halt-event".to_string(), "SecurityHalt".to_string(), "".to_string(), false),
+        ];
+
+        let results = trail.record_batch(&entries);
+        assert!(results[0].is_ok());
+        assert_eq!(trail.entries()[0].entry_type, AuditEntryType::SecurityHalt);
+    }
+
+    #[test]
+    fn test_record_batch_empty() {
+        let mut trail = AuditTrail::new();
+        let results = trail.record_batch(&[]);
+        assert!(results.is_empty());
+        assert_eq!(trail.len(), 0);
     }
 }

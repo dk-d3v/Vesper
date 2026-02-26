@@ -23,7 +23,7 @@ use crate::{
     types::GraphContext,
 };
 use ruvector_graph::{
-    GraphDB, NodeBuilder,
+    GraphDB, NodeBuilder, EdgeBuilder,
     types::{PropertyValue, NodeId},
     GraphNeuralEngine, GnnConfig,
 };
@@ -75,13 +75,12 @@ impl GraphContextProvider {
 
     /// Add a text document to the graph as a `Document` node.
     ///
-    /// The node stores `text` and `metadata` as properties and can be
-    /// retrieved via the hybrid search index.
+    /// Returns the new node's `NodeId` so callers can attach edges to it.
     pub fn add_document(
         &mut self,
         text: &str,
         metadata: &str,
-    ) -> Result<(), AiAssistantError> {
+    ) -> Result<NodeId, AiAssistantError> {
         let node = NodeBuilder::new()
             .label("Document")
             .property("text", text)
@@ -90,9 +89,57 @@ impl GraphContextProvider {
 
         self.graph
             .create_node(node)
-            .map_err(|e| AiAssistantError::GraphContext(e.to_string()))?;
+            .map_err(|e| AiAssistantError::GraphContext(e.to_string()))
+    }
 
-        Ok(())
+    /// Add a named entity as a graph node labelled by its type.
+    ///
+    /// If a node with the same lower-case name already exists the call is
+    /// idempotent — it returns the existing node's ID without creating a
+    /// duplicate.
+    pub fn add_entity_node(
+        &mut self,
+        name: &str,
+        entity_label: &str,
+    ) -> Result<NodeId, AiAssistantError> {
+        // Check for existing node with same name (case-insensitive)
+        let name_lower = name.to_lowercase();
+        let existing = self.graph.get_nodes_by_label(entity_label);
+        for node in &existing {
+            if let Some(PropertyValue::String(n)) = node.get_property("name") {
+                if n.to_lowercase() == name_lower {
+                    return Ok(node.id.clone());
+                }
+            }
+        }
+
+        let node = NodeBuilder::new()
+            .label(entity_label)
+            .property("name", name)
+            .build();
+
+        self.graph
+            .create_node(node)
+            .map_err(|e| AiAssistantError::GraphContext(e.to_string()))
+    }
+
+    /// Create a `MENTIONS` edge from a conversation document node to an entity node.
+    pub fn add_mention_edge(
+        &mut self,
+        conv_node_id: &str,
+        entity_node_id: &str,
+    ) -> Result<(), AiAssistantError> {
+        let edge = EdgeBuilder::new(
+            conv_node_id.to_string(),
+            entity_node_id.to_string(),
+            "MENTIONS",
+        )
+        .build();
+
+        self.graph
+            .create_edge(edge)
+            .map(|_| ())
+            .map_err(|e| AiAssistantError::GraphContext(e.to_string()))
     }
 
     /// Add a causal edge to the local cache (also persisted as a graph edge
@@ -177,17 +224,15 @@ impl GraphContextProvider {
 
         match self.gnn.embed_graph(&node_ids) {
             Ok(graph_embedding) => {
-                let summary = format!(
-                    "\n---\n[GNN] graph_embedding: {} nodes analysed, method={}, dim={}",
-                    graph_embedding.node_count,
-                    graph_embedding.method,
-                    graph_embedding.embedding.len(),
-                );
+                // Log GNN metadata for observability — do NOT append to rag_content
+                // because rag_content flows into the Claude API prompt and would
+                // appear as "[GNN] graph_embedding: N nodes analysed, method=…",
+                // causing Claude to flag it as prompt injection.
                 info!(
                     "GNN analysis complete: {} nodes, method={}",
                     graph_embedding.node_count, graph_embedding.method
                 );
-                format!("{}{}", content, summary)
+                content.to_string()
             }
             Err(e) => {
                 warn!("GNN embed_graph failed: {}; skipping GNN enrichment", e);

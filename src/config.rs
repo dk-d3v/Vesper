@@ -14,6 +14,8 @@ pub struct Config {
     pub claude_model: String,
     /// Path to the local ONNX embedding model — sourced from `EMBEDDING_MODEL_PATH`
     pub embedding_model_path: String,
+    /// Path to the multilingual NER ONNX model directory — sourced from `NER_MODEL_PATH`
+    pub ner_model_path: String,
     /// Extended thinking budget in tokens — sourced from `CLAUDE_THINKING_BUDGET_TOKENS`.
     /// `0` means extended thinking is disabled.
     pub thinking_budget_tokens: u32,
@@ -74,6 +76,9 @@ pub fn load_config_from_env() -> Result<Config, AiAssistantError> {
     let embedding_model_path = std::env::var("EMBEDDING_MODEL_PATH")
         .unwrap_or_else(|_| "./models/paraphrase-multilingual-MiniLM-L12-v2".to_string());
 
+    let ner_model_path = std::env::var("NER_MODEL_PATH")
+        .unwrap_or_else(|_| "./models/multilingual-ner".to_string());
+
     let thinking_budget_tokens = std::env::var("CLAUDE_THINKING_BUDGET_TOKENS")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
@@ -95,6 +100,7 @@ pub fn load_config_from_env() -> Result<Config, AiAssistantError> {
         anthropic_base_url: base_url,
         claude_model,
         embedding_model_path,
+        ner_model_path,
         thinking_budget_tokens,
         thinking_adaptive,
         thinking_effort,

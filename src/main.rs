@@ -20,11 +20,13 @@ mod coherence;
 mod config;
 mod embedding;
 mod error;
+mod forensic;
 mod graph_context;
 mod language;
 mod learning;
 mod memory;
 mod mcp_tools;
+mod ner;
 mod pipeline;
 mod types;
 mod verification;
@@ -35,10 +37,11 @@ use pipeline::Pipeline;
 async fn main() {
     // Initialise structured logging — suppress ort crate noise, default WARN elsewhere.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive("ort=error".parse().unwrap())
-                .add_directive(tracing::Level::WARN.into()),
+                .add_directive(tracing::Level::INFO.into()),
         )
         .init();
 

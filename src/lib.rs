@@ -8,6 +8,7 @@
 #![allow(unused_variables)]
 
 pub mod audit;
+pub mod forensic;
 pub mod claude_api;
 pub mod coherence;
 pub mod config;
@@ -18,6 +19,7 @@ pub mod language;
 pub mod learning;
 pub mod memory;
 pub mod mcp_tools;
+pub mod ner;
 pub mod pipeline;
 pub mod types;
 pub mod verification;

@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use crate::{
-    audit::{AuditTrail, AuditEntryType},
+    audit::{AuditTrail, AuditEntryType, LatencyBreakdown},
     claude_api::ClaudeClient,
     coherence::CoherenceChecker,
     config::{Config, MAX_TOKENS},
@@ -21,6 +21,7 @@ use crate::{
     learning::LearningEngine,
     mcp_tools::McpToolManager,
     memory::MemoryStore,
+    ner::MultilingualNer,
     types::*,
     verification::Verifier,
     embedding::OnnxEmbedding,
@@ -42,6 +43,7 @@ pub struct Pipeline {
     learning: LearningEngine,
     audit: AuditTrail,
     session: Session,
+    ner: MultilingualNer,
 }
 
 impl Pipeline {
@@ -53,7 +55,7 @@ impl Pipeline {
         let embedding = Arc::new(OnnxEmbedding::new(&config.embedding_model_path)?);
 
         let memory = MemoryStore::new_with_arc(Arc::clone(&embedding))?;
-        let graph = GraphContextProvider::new(Arc::clone(&embedding))?;
+        let mut graph = GraphContextProvider::new(Arc::clone(&embedding))?;
         let coherence = CoherenceChecker::new()?;
         let claude = ClaudeClient::new();
         let mcp_path = crate::config::exe_dir().join("mcp_servers.json");
@@ -62,6 +64,38 @@ impl Pipeline {
         let learning = LearningEngine::new(Arc::clone(&embedding))?;
         let audit = AuditTrail::new();
         let session = Session::new();
+
+        // Load NER model (graceful fallback when model is absent)
+        let ner = MultilingualNer::new(&config.ner_model_path)?;
+
+        // Seed GraphDB: pull up to 100 recent episodes from AgenticDB and
+        // extract entities so the graph starts populated on warm restarts.
+        if !ner.is_fallback() {
+            match memory.retrieve_similar("conversation user assistant", 100) {
+                Ok(episodes) => {
+                    let mut seeded = 0usize;
+                    for ep in &episodes {
+                        let doc_id = graph
+                            .add_document(&ep.text, "seed")
+                            .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+
+                        for (name, et) in ner.extract(&ep.text) {
+                            let entity_id = graph
+                                .add_entity_node(&name, et.label())
+                                .unwrap_or_default();
+                            if !entity_id.is_empty() {
+                                let _ = graph.add_mention_edge(&doc_id, &entity_id);
+                            }
+                        }
+                        seeded += 1;
+                    }
+                    tracing::info!("NER graph seed complete: {} episodes processed", seeded);
+                }
+                Err(e) => {
+                    tracing::warn!("NER graph seed skipped (episode retrieval failed): {}", e);
+                }
+            }
+        }
 
         Ok(Self {
             config,
@@ -74,6 +108,7 @@ impl Pipeline {
             learning,
             audit,
             session,
+            ner,
         })
     }
 
@@ -90,20 +125,33 @@ impl Pipeline {
     where
         F: Fn(&str) + Send + 'static,
     {
+        let mut latency = LatencyBreakdown::new();
+
         // Step 1 — validate input and detect language
+        let t = std::time::Instant::now();
         let msg = self.step1_receive(raw_input)?;
+        latency.step1_receive_ms = t.elapsed().as_millis() as u64;
 
         // Step 2 — semantic memory search
+        let t = std::time::Instant::now();
         let semantic = self.step2_semantic_search(&msg)?;
+        latency.step2_semantic_search_ms = t.elapsed().as_millis() as u64;
 
         // Step 3 — graph context (graceful degradation)
+        let t = std::time::Instant::now();
         let graph_ctx = self.step3_graph_context(&msg)?;
+        latency.step3_graph_context_ms = t.elapsed().as_millis() as u64;
 
         // Step 4 — merge context and prepare prompt
+        let t = std::time::Instant::now();
         let prompt = self.step4_prepare_prompt(&msg, &semantic, &graph_ctx)?;
+        latency.step4_prepare_prompt_ms = t.elapsed().as_millis() as u64;
 
         // Step 5 — pre-API coherence check
+        let t = std::time::Instant::now();
         let coherence = self.step5_coherence_check(&prompt)?;
+        latency.step5_coherence_ms = t.elapsed().as_millis() as u64;
+
         let prompt = match coherence {
             CoherenceResult::Reflex => prompt,
             CoherenceResult::Revised(new_ctx) => FinalPrompt {
@@ -119,18 +167,24 @@ impl Pipeline {
         };
 
         // Step 6 — streaming Claude API call (token-by-token)
+        let t = std::time::Instant::now();
         let claude_resp = self.step6_claude_call_stream(&prompt, on_token).await?;
+        latency.step6_claude_api_ms = t.elapsed().as_millis() as u64;
 
         // Step 7 — post-response security / hallucination check
+        let t = std::time::Instant::now();
         let verified = self.step7_security_check(claude_resp, &prompt)?;
+        latency.step7_security_ms = t.elapsed().as_millis() as u64;
 
         // Step 8 — SONA learning record (graceful degradation)
+        let t = std::time::Instant::now();
         let quality = self.step8_learning(&msg, &prompt, &verified)
             .map(|r| r.quality_score)
             .unwrap_or(0.7);
+        latency.step8_learning_ms = t.elapsed().as_millis() as u64;
 
         // Step 9 — AgenticDB update + RVF audit (graceful degradation)
-        let _ = self.step9_update_and_audit(&msg, &verified, quality);
+        let _ = self.step9_update_and_audit(&msg, &verified, quality, latency);
 
         // Step 10 — return verified response, update session
         Ok(self.step10_return(msg, verified))
@@ -141,20 +195,33 @@ impl Pipeline {
     /// Returns the final verified response text, or an error if a
     /// non-degradable step fails (e.g. CoherenceHalt, Claude API error).
     pub async fn execute_turn(&mut self, raw_input: &str) -> Result<String, AiAssistantError> {
+        let mut latency = LatencyBreakdown::new();
+
         // Step 1 — validate input and detect language
+        let t = std::time::Instant::now();
         let msg = self.step1_receive(raw_input)?;
+        latency.step1_receive_ms = t.elapsed().as_millis() as u64;
 
         // Step 2 — semantic memory search
+        let t = std::time::Instant::now();
         let semantic = self.step2_semantic_search(&msg)?;
+        latency.step2_semantic_search_ms = t.elapsed().as_millis() as u64;
 
         // Step 3 — graph context (graceful degradation)
+        let t = std::time::Instant::now();
         let graph_ctx = self.step3_graph_context(&msg)?;
+        latency.step3_graph_context_ms = t.elapsed().as_millis() as u64;
 
         // Step 4 — merge context and prepare prompt
+        let t = std::time::Instant::now();
         let prompt = self.step4_prepare_prompt(&msg, &semantic, &graph_ctx)?;
+        latency.step4_prepare_prompt_ms = t.elapsed().as_millis() as u64;
 
         // Step 5 — pre-API coherence check
+        let t = std::time::Instant::now();
         let coherence = self.step5_coherence_check(&prompt)?;
+        latency.step5_coherence_ms = t.elapsed().as_millis() as u64;
+
         let prompt = match coherence {
             CoherenceResult::Reflex => prompt,
             CoherenceResult::Revised(new_ctx) => FinalPrompt {
@@ -170,18 +237,24 @@ impl Pipeline {
         };
 
         // Step 6 — call Claude API (with optional tool use)
+        let t = std::time::Instant::now();
         let claude_resp = self.step6_claude_call(&prompt).await?;
+        latency.step6_claude_api_ms = t.elapsed().as_millis() as u64;
 
         // Step 7 — post-response security / hallucination check
+        let t = std::time::Instant::now();
         let verified = self.step7_security_check(claude_resp, &prompt)?;
+        latency.step7_security_ms = t.elapsed().as_millis() as u64;
 
         // Step 8 — SONA learning record (graceful degradation)
+        let t = std::time::Instant::now();
         let quality = self.step8_learning(&msg, &prompt, &verified)
             .map(|r| r.quality_score)
             .unwrap_or(0.7);
+        latency.step8_learning_ms = t.elapsed().as_millis() as u64;
 
         // Step 9 — AgenticDB update + RVF audit (graceful degradation)
-        let _ = self.step9_update_and_audit(&msg, &verified, quality);
+        let _ = self.step9_update_and_audit(&msg, &verified, quality, latency);
 
         // Step 10 — return verified response, update session
         Ok(self.step10_return(msg, verified))
@@ -389,6 +462,7 @@ impl Pipeline {
     /// STEP 7 — Post-response security check and witness recording.
     ///
     /// Checks for hallucination (logs warning but does not halt).
+    /// Detects contradictions between context and new response (graceful degradation).
     /// Records the response in the cryptographic witness chain.
     fn step7_security_check(
         &mut self,
@@ -402,6 +476,20 @@ impl Pipeline {
 
         if is_hallucination {
             tracing::warn!("Potential hallucination detected in response");
+        }
+
+        // Contradiction detection between prior context and new response
+        let contradiction = self
+            .coherence
+            .detect_contradictions(&prompt.context, &response.text);
+
+        if contradiction.found {
+            tracing::warn!(
+                "Contradiction detected in response (type={:?}, confidence={:.2}): {}",
+                contradiction.contradiction_type,
+                contradiction.confidence,
+                contradiction.explanation
+            );
         }
 
         self.verifier
@@ -442,12 +530,18 @@ impl Pipeline {
     }
 
     /// STEP 9 — AgenticDB update + RVF audit trail (graceful degradation).
+    ///
+    /// Logs a `pipeline_latency_breakdown` tracing event with real per-step
+    /// timing data passed in from the caller.
     fn step9_update_and_audit(
         &mut self,
         msg: &UserMessage,
         verified: &VerifiedResponse,
         quality_score: f32,
+        mut latency: LatencyBreakdown,
     ) -> Result<AuditResult, AiAssistantError> {
+        let t = std::time::Instant::now();
+
         // Store episode in memory — save user+assistant pair for cross-session recall
         let episode_text = format!("User: {}\nAssistant: {}", msg.text, verified.text);
         let _episode_id = self
@@ -464,9 +558,43 @@ impl Pipeline {
         // Auto-consolidate low-quality episodes
         let _ = self.memory.auto_consolidate();
 
-        // Add conversation turn to graph context
+        // Add conversation turn to graph context and run NER
         let doc = format!("Q: {} A: {}", msg.text, verified.text);
-        let _ = self.graph.add_document(&doc, "conversation");
+        let doc_node_id = self
+            .graph
+            .add_document(&doc, "conversation")
+            .unwrap_or_else(|e| {
+                tracing::warn!("Graph document add failed: {}", e);
+                uuid::Uuid::new_v4().to_string()
+            });
+
+        // Extract entities and link them to the conversation node
+        for (name, entity_type) in self.ner.extract(&doc) {
+            let entity_id = self
+                .graph
+                .add_entity_node(&name, entity_type.label())
+                .unwrap_or_default();
+            if !entity_id.is_empty() {
+                let _ = self.graph.add_mention_edge(&doc_node_id, &entity_id);
+            }
+        }
+
+        latency.step9_audit_ms = t.elapsed().as_millis() as u64;
+        latency.compute_total();
+
+        tracing::info!(
+            total_ms = latency.total_ms,
+            step1_receive_ms = latency.step1_receive_ms,
+            step2_semantic_search_ms = latency.step2_semantic_search_ms,
+            step3_graph_context_ms = latency.step3_graph_context_ms,
+            step4_prepare_prompt_ms = latency.step4_prepare_prompt_ms,
+            step5_coherence_ms = latency.step5_coherence_ms,
+            step6_claude_api_ms = latency.step6_claude_api_ms,
+            step7_security_ms = latency.step7_security_ms,
+            step8_learning_ms = latency.step8_learning_ms,
+            step9_audit_ms = latency.step9_audit_ms,
+            "pipeline_latency_breakdown"
+        );
 
         // RVF audit trail
         let audit_data = format!(
