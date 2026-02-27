@@ -33,8 +33,21 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
     thread,
 };
-use tracing::{info, warn, error};
+use tracing::{debug, info, warn, error};
 use uuid::Uuid;
+
+/// Minimum cosine-similarity score an episode must achieve against the query
+/// embedding to be included in retrieval results.
+///
+/// Value `0.7` matches the consensus found across ruvector reference
+/// implementations:
+///   - `ruvector-dag/src/sona/reasoning_bank.rs` → `similarity_threshold: 0.7`
+///   - `prime-radiant/src/ruvllm_integration/memory_layer.rs` → `semantic_similarity_threshold: 0.7`
+///   - `subpolynomial-time/src/fusion/fusion_graph.rs` → `similarity_threshold: 0.7`
+///
+/// Raise to `0.85` for stricter recall (semantic cache use-case), lower to
+/// `0.5` for broader associative recall.
+const MIN_EPISODE_SIMILARITY: f32 = 0.7;
 
 // ── Fallback episode record ───────────────────────────────────────────────────
 
@@ -338,32 +351,73 @@ impl MemoryStore {
 
         let mut episodes: Vec<Episode> = match &self.backend {
             MemoryBackend::Agentic(db) => {
+                // Fetch more than top_k so we have headroom after similarity
+                // filtering (AgenticDB doesn't expose a score cut-off).
+                let fetch_k = (top_k * 3).max(top_k + 10);
                 let raw = db
-                    .retrieve_similar_episodes(query_text, top_k)
+                    .retrieve_similar_episodes(query_text, fetch_k)
                     .map_err(|e| AiAssistantError::Memory(e.to_string()))?;
-                raw.iter()
-                    .map(|ep| {
+
+                let mut filtered: Vec<Episode> = raw
+                    .iter()
+                    .filter_map(|ep| {
+                        // Score must meet the minimum threshold; episodes without
+                        // an embedding vector are silently skipped.
+                        if ep.embedding.is_empty() {
+                            return None;
+                        }
+                        let sim = cosine_sim(&query_emb, &ep.embedding);
+                        if sim < MIN_EPISODE_SIMILARITY {
+                            debug!(
+                                episode_id = %ep.id,
+                                similarity = sim,
+                                threshold = MIN_EPISODE_SIMILARITY,
+                                "episode below similarity threshold — skipped"
+                            );
+                            return None;
+                        }
                         let quality = self
                             .quality_map
                             .get(&ep.id)
                             .map(|(q, _)| *q)
                             .unwrap_or(1.0);
-                        reflexion_to_episode(ep, quality)
+                        Some(reflexion_to_episode(ep, quality))
                     })
-                    .collect()
+                    .take(top_k)
+                    .collect();
+
+                let rejected = raw.len().saturating_sub(filtered.len());
+                if rejected > 0 {
+                    info!(
+                        rejected,
+                        threshold = MIN_EPISODE_SIMILARITY,
+                        "Agentic: {} episode(s) below similarity threshold filtered out",
+                        rejected
+                    );
+                }
+                filtered
             }
             MemoryBackend::InMemory(episodes) => {
                 let mut scored: Vec<(f32, Episode)> = episodes
                     .iter()
-                    .map(|ep| {
+                    .filter_map(|ep| {
                         let sim = cosine_sim(&query_emb, &ep.embedding);
+                        if sim < MIN_EPISODE_SIMILARITY {
+                            debug!(
+                                episode_id = %ep.id,
+                                similarity = sim,
+                                threshold = MIN_EPISODE_SIMILARITY,
+                                "episode below similarity threshold — skipped"
+                            );
+                            return None;
+                        }
                         let age = ep
                             .timestamp
                             .elapsed()
                             .unwrap_or_default()
                             .as_secs();
                         let tier = Self::get_tier(age);
-                        (
+                        Some((
                             sim,
                             Episode {
                                 id: ep.id.clone(),
@@ -373,12 +427,26 @@ impl MemoryStore {
                                 tier,
                                 quality_score: ep.quality,
                             },
-                        )
+                        ))
                     })
                     .collect();
+
                 scored.sort_by(|a, b| {
                     b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
                 });
+
+                let total = episodes.len();
+                let kept = scored.len().min(top_k);
+                let rejected = total.saturating_sub(scored.len());
+                if rejected > 0 {
+                    info!(
+                        rejected,
+                        threshold = MIN_EPISODE_SIMILARITY,
+                        "InMemory: {} episode(s) below similarity threshold filtered out",
+                        rejected
+                    );
+                }
+
                 scored
                     .into_iter()
                     .take(top_k)
