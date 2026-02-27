@@ -103,6 +103,9 @@ pub struct FinalPrompt {
     /// Cross-session memory episodes — injected into the *system* prompt
     /// under a `<memory>` tag so Claude can reference them as long-term recall.
     pub memory_context: String,
+    /// High-quality past response patterns — injected under `<reasoning_hints>`
+    /// to guide Claude toward proven response strategies.
+    pub reasoning_hints: String,
     /// Current-session graph-RAG content — injected into the *user* message.
     pub context: String,
     pub user_text: String,
@@ -110,19 +113,26 @@ pub struct FinalPrompt {
 }
 
 impl FinalPrompt {
-    /// Returns the system prompt with the optional `<memory>` block appended.
+    /// Returns the system prompt with optional `<memory>` and
+    /// `<reasoning_hints>` blocks appended.
     ///
-    /// The `<memory>` block is placed *after* all system instructions so that
-    /// Claude reads the behavioural rules first, then the factual memories.
+    /// Both blocks are placed *after* all system instructions so that
+    /// Claude reads the behavioural rules first.
     pub fn system_with_memory(&self) -> String {
-        if self.memory_context.is_empty() {
-            self.system.clone()
-        } else {
-            format!(
-                "{}\n\n<memory>\n{}\n</memory>",
-                self.system, self.memory_context
-            )
+        let mut out = self.system.clone();
+
+        if !self.memory_context.is_empty() {
+            out.push_str(&format!("\n\n<memory>\n{}\n</memory>", self.memory_context));
         }
+
+        if !self.reasoning_hints.is_empty() {
+            out.push_str(&format!(
+                "\n\n<reasoning_hints>\n{}\n</reasoning_hints>",
+                self.reasoning_hints
+            ));
+        }
+
+        out
     }
 
     /// Returns the combined graph-RAG context + user text for the `user` role message.

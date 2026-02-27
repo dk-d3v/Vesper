@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 ruvector-core                = { path = "./ruvector/crates/ruvector-core" }
+ruvector-dag                 = { path = "./ruvector/crates/ruvector-dag" }
 ruvector-sona                = { path = "./ruvector/crates/sona" }
 ruvector-graph               = { path = "./ruvector/crates/ruvector-graph" }
 prime-radiant                = { path = "./ruvector/crates/prime-radiant" }

@@ -59,6 +59,8 @@ fn test_session_add_turn_trims_to_50() {
 fn test_final_prompt_full_content_empty_context() {
     let prompt = FinalPrompt {
         system: "System prompt".to_string(),
+        memory_context: String::new(),
+        reasoning_hints: String::new(),
         context: String::new(),
         user_text: "Hello, AI!".to_string(),
         estimated_tokens: 10,
@@ -73,6 +75,8 @@ fn test_final_prompt_full_content_empty_context() {
 fn test_final_prompt_full_content_with_context() {
     let prompt = FinalPrompt {
         system: "System".to_string(),
+        memory_context: String::new(),
+        reasoning_hints: String::new(),
         context: "Some background info".to_string(),
         user_text: "My question".to_string(),
         estimated_tokens: 20,

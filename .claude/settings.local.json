@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd /c/Users/admin/ai-assistant && cargo build --release --features onnx 2>&1)"
+    ]
+  }
+}

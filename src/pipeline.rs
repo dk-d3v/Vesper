@@ -22,6 +22,7 @@ use crate::{
     mcp_tools::McpToolManager,
     memory::MemoryStore,
     ner::MultilingualNer,
+    reasoning::ReasoningStore,
     types::*,
     verification::Verifier,
     embedding::OnnxEmbedding,
@@ -41,6 +42,7 @@ pub struct Pipeline {
     mcp: McpToolManager,
     verifier: Verifier,
     learning: LearningEngine,
+    reasoning: ReasoningStore,
     audit: AuditTrail,
     session: Session,
     ner: MultilingualNer,
@@ -62,6 +64,7 @@ impl Pipeline {
         let mcp = McpToolManager::load(mcp_path.to_str().unwrap_or("mcp_servers.json"))?;
         let verifier = Verifier::new()?;
         let learning = LearningEngine::new(Arc::clone(&embedding))?;
+        let reasoning = ReasoningStore::new(Arc::clone(&embedding));
         let audit = AuditTrail::new();
         let session = Session::new();
 
@@ -106,6 +109,7 @@ impl Pipeline {
             mcp,
             verifier,
             learning,
+            reasoning,
             audit,
             session,
             ner,
@@ -328,10 +332,19 @@ impl Pipeline {
             .collect::<Vec<_>>()
             .join("\n---\n");
 
+        // Reasoning hints — top-3 similar high-quality past responses.
+        let similar = self.reasoning.find_similar(&msg.text, 3);
+        let reasoning_hints = if similar.is_empty() {
+            String::new()
+        } else {
+            similar.join("\n---\n")
+        };
+
         // Graph RAG → user message context section (current-session knowledge).
         let context = graph.rag_content.clone();
 
         let estimated_tokens = memory_context.len() / 4
+            + reasoning_hints.len() / 4
             + context.len() / 4
             + msg.text.len() / 4
             + system.len() / 4;
@@ -346,6 +359,7 @@ impl Pipeline {
         Ok(FinalPrompt {
             system,
             memory_context,
+            reasoning_hints,
             context,
             user_text: msg.text.clone(),
             estimated_tokens,
@@ -525,6 +539,21 @@ impl Pipeline {
                     pattern_count = r.pattern_count,
                     "step8_learning_ok"
                 );
+
+                // Store high-quality responses in DagReasoningBank for
+                // future pattern-guided responses (step4 reasoning hints).
+                if r.quality_score >= 0.7 {
+                    if let Some(pid) = self.reasoning.store_if_quality(
+                        &verified.text,
+                        r.quality_score,
+                    ) {
+                        tracing::debug!(
+                            pattern_id = pid,
+                            quality = r.quality_score,
+                            "step8: pattern stored in reasoning bank"
+                        );
+                    }
+                }
 
                 // Loop B: Background analysis — her 5 turda bir çalıştır
                 // (ruvllm Loop B karşılığı: K-means++ yerine streak/cluster detection)

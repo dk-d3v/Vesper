@@ -39,12 +39,13 @@ dependencies = [
  "dotenvy",
  "futures-util",
  "hex",
- "ndarray",
+ "ndarray 0.16.1",
  "ort",
  "prime-radiant",
  "reqwest",
  "ruvector-cognitive-container",
  "ruvector-core",
+ "ruvector-dag",
  "ruvector-graph",
  "ruvector-math",
  "ruvector-mincut",
@@ -633,6 +634,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06d2e3287df1c007e74221c49ca10a95d557349e54b3a75dc2fb14712c751f04"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "dashmap"
+version = "5.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "978747c1d849a7d2ee5e8adc0159961c48fb7e5db2f06af6723b80123bb53856"
+dependencies = [
+ "cfg-if",
+ "hashbrown 0.14.5",
+ "lock_api",
+ "once_cell",
+ "parking_lot_core",
 ]
 
 [[package]]
@@ -1813,6 +1827,19 @@ dependencies = [
 
 [[package]]
 name = "ndarray"
+version = "0.15.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "adb12d4e967ec485a5f71c6311fe28158e9d6f4bc4a447b474184d0f91a8fa32"
+dependencies = [
+ "matrixmultiply",
+ "num-complex",
+ "num-integer",
+ "num-traits",
+ "rawpointer",
+]
+
+[[package]]
+name = "ndarray"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "882ed72dce9365842bf196bdeedf5055305f11fc8c03dee7bb0194a6cad34841"
@@ -2030,7 +2057,7 @@ checksum = "52afb44b6b0cffa9bf45e4d37e5a4935b0334a51570658e279e9e3e6cf324aa5"
 dependencies = [
  "half",
  "libloading",
- "ndarray",
+ "ndarray 0.16.1",
  "ort-sys",
  "tracing",
 ]
@@ -2211,8 +2238,8 @@ dependencies = [
  "bincode 2.0.1",
  "blake3",
  "chrono",
- "dashmap",
- "ndarray",
+ "dashmap 6.1.0",
+ "ndarray 0.16.1",
  "once_cell",
  "ordered-float",
  "parking_lot",
@@ -2661,10 +2688,10 @@ dependencies = [
  "bincode 2.0.1",
  "chrono",
  "crossbeam",
- "dashmap",
+ "dashmap 6.1.0",
  "hnsw_rs",
  "memmap2",
- "ndarray",
+ "ndarray 0.16.1",
  "once_cell",
  "parking_lot",
  "rand 0.8.5",
@@ -2682,6 +2709,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruvector-dag"
+version = "2.0.4"
+dependencies = [
+ "crossbeam",
+ "dashmap 5.5.3",
+ "getrandom 0.2.17",
+ "ndarray 0.15.6",
+ "parking_lot",
+ "rand 0.8.5",
+ "ruvector-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
 name = "ruvector-graph"
 version = "2.0.4"
 dependencies = [
@@ -2689,14 +2736,14 @@ dependencies = [
  "bincode 2.0.1",
  "chrono",
  "crossbeam",
- "dashmap",
+ "dashmap 6.1.0",
  "futures",
  "hnsw_rs",
  "lru",
  "lz4",
  "memmap2",
  "moka",
- "ndarray",
+ "ndarray 0.16.1",
  "nom",
  "nom_locate",
  "num_cpus",
@@ -2738,7 +2785,7 @@ version = "2.0.4"
 dependencies = [
  "anyhow",
  "crossbeam",
- "dashmap",
+ "dashmap 6.1.0",
  "ordered-float",
  "parking_lot",
  "petgraph",
@@ -2756,7 +2803,7 @@ dependencies = [
 name = "ruvector-solver"
 version = "2.0.4"
 dependencies = [
- "dashmap",
+ "dashmap 6.1.0",
  "getrandom 0.2.17",
  "parking_lot",
  "rand 0.8.5",
@@ -4316,6 +4363,20 @@ name = "zeroize"
 version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b97154e67e32c85465826e8bcc1c59429aaaf107c1e4a9e53c8d8ccd5eff88d0"
+dependencies = [
+ "zeroize_derive",
+]
+
+[[package]]
+name = "zeroize_derive"
+version = "1.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85a5b4158499876c763cb03bc4e49185d3cccbabb15b33c627f7884f43db852e"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "zerotrie"

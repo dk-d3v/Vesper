@@ -21,5 +21,6 @@ pub mod memory;
 pub mod mcp_tools;
 pub mod ner;
 pub mod pipeline;
+pub mod reasoning;
 pub mod types;
 pub mod verification;
