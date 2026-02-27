@@ -25,7 +25,7 @@ fn test_memory_store_new_succeeds() {
 #[test]
 fn test_store_episode_returns_non_empty_id() {
     let mut store = make_store();
-    let result = store.store_episode("Test episode content", 0.9);
+    let result = store.store_episode("Test episode content", "This is the assistant reply.", 0.9);
     assert!(result.is_ok(), "store_episode should succeed");
     let id = result.unwrap();
     assert!(!id.is_empty(), "Episode ID should not be empty");
@@ -39,7 +39,7 @@ fn test_retrieve_similar_respects_top_k() {
     // Store 10 episodes
     for i in 0..10 {
         store
-            .store_episode(&format!("episode content number {}", i), 0.8)
+            .store_episode(&format!("episode content number {}", i), "assistant reply", 0.8)
             .unwrap();
     }
 
@@ -57,7 +57,7 @@ fn test_retrieve_similar_respects_top_k() {
 fn test_retrieve_similar_returns_stored_text() {
     let mut store = make_store();
     let unique_text = "unique phrase for retrieval test xyzzy42";
-    store.store_episode(unique_text, 0.9).unwrap();
+    store.store_episode(unique_text, "This is the assistant's answer.", 0.9).unwrap();
 
     let results = store.retrieve_similar(unique_text, 5).unwrap();
     // In the in-memory fallback, the stored text should be retrievable
@@ -95,9 +95,9 @@ fn test_auto_consolidate_removes_low_quality() {
     let mut store = make_store();
 
     // Store one high-quality and one zero-quality episode
-    store.store_episode("high quality episode", 0.9).unwrap();
-    store.store_episode("zero quality episode", 0.0).unwrap();
-    store.store_episode("very low quality", 0.1).unwrap();
+    store.store_episode("high quality episode", "Great assistant response.", 0.9).unwrap();
+    store.store_episode("zero quality episode", "Poor assistant response.", 0.0).unwrap();
+    store.store_episode("very low quality", "Weak assistant response.", 0.1).unwrap();
 
     let removed = store.auto_consolidate().unwrap();
     // Should remove quality < 0.3 episodes (0.0 and 0.1)

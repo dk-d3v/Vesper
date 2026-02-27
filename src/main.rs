@@ -28,6 +28,7 @@ mod memory;
 mod mcp_tools;
 mod ner;
 mod pipeline;
+mod reasoning;
 mod types;
 mod verification;
 

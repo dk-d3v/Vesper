@@ -608,15 +608,32 @@ impl Pipeline {
     ) -> Result<AuditResult, AiAssistantError> {
         let t = std::time::Instant::now();
 
-        // Store episode in memory — save user+assistant pair for cross-session recall
+        // Store episode in memory — save user+assistant pair for cross-session recall.
+        // Near-duplicate skip: if a very similar episode already exists (cosine > 0.92)
+        // we skip storing to prevent the same conversation being recorded repeatedly.
+        // Pattern mirrors OSpipe::FrameDeduplicator (dedup_threshold 0.95).
+        //
+        // Dedup check uses the combined text so structural differences (e.g. same
+        // question, different wording) are caught. Storage uses only msg.text as the
+        // embedded critique field (see memory::store_episode for rationale).
+        const EPISODE_DEDUP_THRESHOLD: f32 = 0.92;
         let episode_text = format!("User: {}\nAssistant: {}", msg.text, verified.text);
-        let _episode_id = self
-            .memory
-            .store_episode(&episode_text, quality_score)
-            .unwrap_or_else(|e| {
-                tracing::warn!("Episode storage failed: {}", e);
-                "unknown".to_string()
-            });
+
+        if self.memory.is_near_duplicate(&episode_text, EPISODE_DEDUP_THRESHOLD) {
+            tracing::info!(
+                threshold = EPISODE_DEDUP_THRESHOLD,
+                query_preview = %msg.text.chars().take(60).collect::<String>(),
+                "step9: near-duplicate episode skipped — not storing"
+            );
+        } else {
+            let _episode_id = self
+                .memory
+                .store_episode(&msg.text, &verified.text, quality_score)
+                .unwrap_or_else(|e| {
+                    tracing::warn!("Episode storage failed: {}", e);
+                    "unknown".to_string()
+                });
+        }
 
         // Add causal edge
         let _ = self.memory.add_causal_edge(&msg.text, &verified.text);

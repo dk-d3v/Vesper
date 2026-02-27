@@ -1,21 +1,8 @@
-//! Memory module — episode storage and retrieval.
+//! Memory module — episode storage and retrieval with sheaf-graph coherence.
 //!
-//! Wraps [`AgenticDB`] from `ruvector-core` with [`OnnxEmbedding`] as the
-//! embedding provider.  Never uses `HashEmbedding`.
-//!
-//! # Graceful degradation
-//! If `AgenticDB` fails to initialize (e.g., missing disk path, redb error),
-//! the store transparently falls back to an in-memory `Vec` with cosine
-//! similarity search.
-//!
-//! # Temporal compression
-//! Episode embeddings are compressed through `ruvector-temporal-tensor`
-//! before being returned, applying tiered quantization (8/5/3-bit) based on
-//! the episode's age.
-//!
-//! # OT ranking
-//! Retrieved episodes are ranked with Sliced Wasserstein distance
-//! (`ruvector-math`), falling back to cosine similarity on failure.
+//! Uses [`AgenticDB`] + [`OnnxEmbedding`] for semantic storage and falls back
+//! to an in-memory Vec when AgenticDB is unavailable. [`MemoryCoherenceLayer`]
+//! (prime-radiant) tracks episodes in a SheafGraph for contradiction detection.
 
 use crate::{
     config::{MEMORY_TOP_K, SKILL_TOP_K},
@@ -23,31 +10,31 @@ use crate::{
     error::AiAssistantError,
     types::{Episode, EpisodeTier, SemanticContext},
 };
+use prime_radiant::ruvllm_integration::{
+    MemoryCoherenceConfig, MemoryCoherenceLayer, MemoryEntry,
+};
 use ruvector_core::{embeddings::BoxedEmbeddingProvider, AgenticDB};
 use ruvector_core::types::DbOptions;
 use ruvector_math::optimal_transport::{OptimalTransport, SlicedWasserstein};
 use ruvector_temporal_tensor::{segment as tt_segment, TemporalTensorCompressor, TierPolicy};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
     thread,
 };
-use tracing::{debug, info, warn, error};
+use tracing::{info, warn, error};
 use uuid::Uuid;
 
-/// Minimum cosine-similarity score an episode must achieve against the query
-/// embedding to be included in retrieval results.
+/// Minimum cosine-similarity for episode retrieval.
 ///
-/// Value `0.7` matches the consensus found across ruvector reference
-/// implementations:
-///   - `ruvector-dag/src/sona/reasoning_bank.rs` → `similarity_threshold: 0.7`
-///   - `prime-radiant/src/ruvllm_integration/memory_layer.rs` → `semantic_similarity_threshold: 0.7`
-///   - `subpolynomial-time/src/fusion/fusion_graph.rs` → `similarity_threshold: 0.7`
-///
-/// Raise to `0.85` for stricter recall (semantic cache use-case), lower to
-/// `0.5` for broader associative recall.
-const MIN_EPISODE_SIMILARITY: f32 = 0.7;
+/// Matches the consensus across ruvector reference implementations
+/// (`reasoning_bank.rs`, `memory_layer.rs`, `fusion_graph.rs`): 0.7.
+/// Tuned down to 0.62 for broader associative recall in practice.
+const MIN_EPISODE_SIMILARITY: f32 = 0.62;
+
+/// Sliding window size for near-duplicate detection (mirrors `FrameDeduplicator`).
+const DEDUP_WINDOW_SIZE: usize = 50;
 
 // ── Fallback episode record ───────────────────────────────────────────────────
 
@@ -79,23 +66,34 @@ pub struct MemoryStore {
     causal_cache: Vec<(String, String)>,
     /// Maps episode_id → (quality_score, store_time) for consolidation.
     quality_map: HashMap<String, (f32, SystemTime)>,
+    /// Sliding window of recent embeddings for near-duplicate detection.
+    dedup_window: VecDeque<Vec<f32>>,
+    /// Sheaf-graph coherence layer — contradiction detection across episodes.
+    coherence: MemoryCoherenceLayer,
 }
 
 // ── Conversions ───────────────────────────────────────────────────────────────
 
-/// Convert a `ReflexionEpisode` (ruvector-core internal type) to our [`Episode`].
-fn reflexion_to_episode(
-    ep: &ruvector_core::agenticdb::ReflexionEpisode,
-    quality: f32,
-) -> Episode {
+fn reflexion_to_episode(ep: &ruvector_core::agenticdb::ReflexionEpisode, quality: f32) -> Episode {
     let now_ts = chrono::Utc::now().timestamp();
     let age_secs = (now_ts - ep.timestamp).max(0) as u64;
     let tier = MemoryStore::get_tier(age_secs);
     let ts = UNIX_EPOCH + Duration::from_secs(ep.timestamp.max(0) as u64);
 
+    // Build full Q+A text for the <memory> block:
+    //   task       = user_query  (what was asked)
+    //   observations[0] = assistant_response (what was answered)
+    // critique is only the embedding key — not shown to Claude.
+    let assistant_text = ep.observations.first().map(|s| s.as_str()).unwrap_or("");
+    let text = if assistant_text.is_empty() {
+        ep.task.clone()
+    } else {
+        format!("User: {}\nAssistant: {}", ep.task, assistant_text)
+    };
+
     Episode {
         id: ep.id.clone(),
-        text: ep.critique.clone(),
+        text,
         embedding: ep.embedding.clone(),
         timestamp: ts,
         tier,
@@ -103,17 +101,62 @@ fn reflexion_to_episode(
     }
 }
 
+// ── Module-private helpers ────────────────────────────────────────────────────
+
+/// Try to open AgenticDB with retry on lock conflict; fall back to InMemory.
+fn init_agentic_backend(provider: BoxedEmbeddingProvider, options: DbOptions) -> MemoryBackend {
+    const MAX_TRIES: u8 = 3;
+    let mut last_locked = false;
+    for attempt in 1..=MAX_TRIES {
+        match AgenticDB::with_embedding_provider(options.clone(), provider.clone()) {
+            Ok(db) => {
+                info!("AgenticDB initialised with OnnxEmbedding provider (attempt {})", attempt);
+                return MemoryBackend::Agentic(db);
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("already open") || msg.contains("Cannot acquire lock") {
+                    error!(
+                        "AgenticDB lock conflict ({}/{}): {} — \
+                         is another instance of ai-assistant already running?",
+                        attempt, MAX_TRIES, msg
+                    );
+                    if attempt < MAX_TRIES {
+                        thread::sleep(Duration::from_millis(500));
+                    }
+                    last_locked = true;
+                } else {
+                    warn!("AgenticDB init failed ({}); falling back to in-memory store", e);
+                    break;
+                }
+            }
+        }
+    }
+    if last_locked {
+        error!(
+            "AgenticDB still locked after {} attempts — in-memory store (non-persistent). \
+             Ensure no other instance is running, then restart.",
+            MAX_TRIES
+        );
+    }
+    MemoryBackend::InMemory(Vec::new())
+}
+
+/// Build a [`MemoryCoherenceLayer`] configured for the project embedding dimension.
+fn new_coherence_layer() -> MemoryCoherenceLayer {
+    MemoryCoherenceLayer::with_config(MemoryCoherenceConfig {
+        embedding_dim: EMBEDDING_DIM,
+        ..Default::default()
+    })
+}
+
 // ── Core impl ─────────────────────────────────────────────────────────────────
 
 impl MemoryStore {
-    /// Initialise the store with a shared `Arc<OnnxEmbedding>`.
-    ///
-    /// Preferred constructor when the same embedding model is also used by
-    /// `GraphContextProvider` — avoids loading the ONNX model twice.
+    /// Initialise with a shared `Arc<OnnxEmbedding>` (preferred when sharing
+    /// the embedding model with `GraphContextProvider`).
     pub fn new_with_arc(embedding_arc: Arc<OnnxEmbedding>) -> Result<Self, AiAssistantError> {
-        // Coerce Arc<OnnxEmbedding> → Arc<dyn EmbeddingProvider>
         let provider: BoxedEmbeddingProvider = embedding_arc.clone();
-
         let options = DbOptions {
             dimensions: EMBEDDING_DIM,
             storage_path: crate::config::exe_dir()
@@ -123,82 +166,20 @@ impl MemoryStore {
                 .into_owned(),
             ..DbOptions::default()
         };
-
-        // Retry up to 3 times with 500 ms backoff.
-        // "Database already open" means a previous instance still holds the
-        // redb OS-level exclusive lock — retrying covers clean-shutdown races.
-        const MAX_TRIES: u8 = 3;
-        let backend = {
-            let mut last_err = None;
-            let mut result = None;
-            for attempt in 1..=MAX_TRIES {
-                match AgenticDB::with_embedding_provider(options.clone(), provider.clone()) {
-                    Ok(db) => {
-                        info!("AgenticDB initialised with OnnxEmbedding provider (attempt {})", attempt);
-                        result = Some(MemoryBackend::Agentic(db));
-                        break;
-                    }
-                    Err(e) => {
-                        let msg = e.to_string();
-                        if msg.contains("already open") || msg.contains("Cannot acquire lock") {
-                            error!(
-                                "AgenticDB lock conflict (attempt {}/{}): {} — \
-                                 is another instance of ai-assistant already running? \
-                                 Close it and restart.",
-                                attempt, MAX_TRIES, msg
-                            );
-                            if attempt < MAX_TRIES {
-                                thread::sleep(Duration::from_millis(500));
-                            }
-                            last_err = Some(e);
-                        } else {
-                            warn!(
-                                "AgenticDB init failed ({}); falling back to in-memory store",
-                                e
-                            );
-                            last_err = Some(e);
-                            break;
-                        }
-                    }
-                }
-            }
-            match result {
-                Some(b) => b,
-                None => {
-                    if let Some(e) = last_err {
-                        let msg = e.to_string();
-                        if msg.contains("already open") || msg.contains("Cannot acquire lock") {
-                            error!(
-                                "AgenticDB still locked after {} attempts — falling back to \
-                                 in-memory store. Memory will NOT persist this session. \
-                                 Ensure no other instance is running, then restart.",
-                                MAX_TRIES
-                            );
-                        }
-                    }
-                    MemoryBackend::InMemory(Vec::new())
-                }
-            }
-        };
-
         Ok(Self {
             embedding: embedding_arc,
-            backend,
+            backend: init_agentic_backend(provider, options),
             causal_cache: Vec::new(),
             quality_map: HashMap::new(),
+            dedup_window: VecDeque::with_capacity(DEDUP_WINDOW_SIZE),
+            coherence: new_coherence_layer(),
         })
     }
 
-    /// Initialise the store with `OnnxEmbedding` (takes ownership).
-    ///
-    /// Wraps the value in `Arc` internally. Prefer [`MemoryStore::new_with_arc`]
-    /// when sharing the embedding model with other components.
+    /// Initialise with `OnnxEmbedding` (takes ownership; wraps in `Arc` internally).
     pub fn new(embedding: OnnxEmbedding) -> Result<Self, AiAssistantError> {
         let embedding_arc: Arc<OnnxEmbedding> = Arc::new(embedding);
-
-        // Coerce Arc<OnnxEmbedding> → Arc<dyn EmbeddingProvider>
         let provider: BoxedEmbeddingProvider = embedding_arc.clone();
-
         let options = DbOptions {
             dimensions: EMBEDDING_DIM,
             storage_path: crate::config::exe_dir()
@@ -208,80 +189,25 @@ impl MemoryStore {
                 .into_owned(),
             ..DbOptions::default()
         };
-
-        // Retry up to 3 times with 500 ms backoff (same as new_with_arc).
-        const MAX_TRIES: u8 = 3;
-        let backend = {
-            let mut last_err = None;
-            let mut result = None;
-            for attempt in 1..=MAX_TRIES {
-                match AgenticDB::with_embedding_provider(options.clone(), provider.clone()) {
-                    Ok(db) => {
-                        info!("AgenticDB initialised with OnnxEmbedding provider (attempt {})", attempt);
-                        result = Some(MemoryBackend::Agentic(db));
-                        break;
-                    }
-                    Err(e) => {
-                        let msg = e.to_string();
-                        if msg.contains("already open") || msg.contains("Cannot acquire lock") {
-                            error!(
-                                "AgenticDB lock conflict (attempt {}/{}): {} — \
-                                 is another instance of ai-assistant already running?",
-                                attempt, MAX_TRIES, msg
-                            );
-                            if attempt < MAX_TRIES {
-                                thread::sleep(Duration::from_millis(500));
-                            }
-                            last_err = Some(e);
-                        } else {
-                            warn!(
-                                "AgenticDB init failed ({}); falling back to in-memory store",
-                                e
-                            );
-                            last_err = Some(e);
-                            break;
-                        }
-                    }
-                }
-            }
-            match result {
-                Some(b) => b,
-                None => {
-                    if let Some(e) = last_err {
-                        let msg = e.to_string();
-                        if msg.contains("already open") || msg.contains("Cannot acquire lock") {
-                            error!(
-                                "AgenticDB still locked after {} attempts — falling back to \
-                                 in-memory store. Memory will NOT persist this session.",
-                                MAX_TRIES
-                            );
-                        }
-                    }
-                    MemoryBackend::InMemory(Vec::new())
-                }
-            }
-        };
-
         Ok(Self {
             embedding: embedding_arc,
-            backend,
+            backend: init_agentic_backend(provider, options),
             causal_cache: Vec::new(),
             quality_map: HashMap::new(),
+            dedup_window: VecDeque::with_capacity(DEDUP_WINDOW_SIZE),
+            coherence: new_coherence_layer(),
         })
     }
 
-    /// Test-only constructor that skips AgenticDB and uses in-memory storage.
-    ///
-    /// AgenticDB pre-allocates ~2 GB which crashes CI under memory pressure;
-    /// this path bypasses that allocation while exercising all public methods.
-    /// Available in all build profiles so integration tests in `tests/` can use it.
+    /// Test-only constructor — skips AgenticDB (avoids ~2 GB pre-alloc in CI).
     pub fn new_in_memory_for_test(embedding: OnnxEmbedding) -> Self {
-        let embedding_arc = Arc::new(embedding);
         Self {
-            embedding: embedding_arc,
+            embedding: Arc::new(embedding),
             backend: MemoryBackend::InMemory(Vec::new()),
             causal_cache: Vec::new(),
             quality_map: HashMap::new(),
+            dedup_window: VecDeque::with_capacity(DEDUP_WINDOW_SIZE),
+            coherence: new_coherence_layer(),
         }
     }
 
@@ -302,38 +228,88 @@ impl MemoryStore {
 
     // ── Store ─────────────────────────────────────────────────────────────────
 
-    /// Persist an episode; returns its unique ID.
+    /// Persist an episode and register it in the coherence layer; returns its ID.
+    ///
+    /// Coherence gate runs **before** the backend write — if the SheafGraph detects
+    /// a contradiction the episode is rejected and `Err` is returned immediately.
+    ///
+    /// # Embedding strategy
+    /// Only `user_query` is used to generate the embedding (critique field in
+    /// AgenticDB). This mirrors the ruvector demo pattern where `critique` is a
+    /// short lesson/query string — NOT the full assistant response — so that
+    /// future retrievals with short queries yield high cosine similarity.
+    /// `assistant_response` is stored as an observation (human-readable) but is
+    /// NOT embedded.
     pub fn store_episode(
         &mut self,
-        text: &str,
+        user_query: &str,
+        assistant_response: &str,
         quality_score: f32,
     ) -> Result<String, AiAssistantError> {
         let now = SystemTime::now();
+        // Embed only the user query — short, focused embedding avoids dilution
+        // caused by mixing 500-word assistant responses into the vector.
+        let embedding = self.embedding.embed(user_query)?;
 
-        // Pre-compute embedding for InMemory path before taking &mut backend.
-        let precomputed_emb = if matches!(self.backend, MemoryBackend::InMemory(_)) {
-            Some(self.embedding.embed(text)?)
-        } else {
-            None
-        };
+        // ── Coherence gate (pre-write) ────────────────────────────────────────
+        let coherence_key = Uuid::new_v4().to_string();
+        let entry = MemoryEntry::episodic(coherence_key.clone(), embedding.clone(), 0);
+        match self.coherence.add_with_coherence(entry) {
+            Ok(result) if !result.is_coherent => {
+                warn!(
+                    episode_key = %coherence_key,
+                    conflicts  = result.conflicting_memories.len(),
+                    energy     = result.energy,
+                    query_preview = %user_query.chars().take(60).collect::<String>(),
+                    "coherence: contradiction detected — episode rejected (not stored)"
+                );
+                return Err(AiAssistantError::Memory(
+                    "coherence contradiction: episode conflicts with existing memory".to_string(),
+                ));
+            }
+            Ok(_) => {
+                // Coherent — proceed to backend write.
+            }
+            Err(e) => {
+                // Coherence layer error is non-fatal; log and continue.
+                warn!("coherence layer insert failed: {e}");
+            }
+        }
 
+        // ── Backend write ─────────────────────────────────────────────────────
+        // AgenticDB: task = user_query (short description),
+        //            observations = [assistant_response] (full detail),
+        //            critique = user_query  ← ONLY THIS IS EMBEDDED for retrieval
+        let combined_text = format!("User: {}\nAssistant: {}", user_query, assistant_response);
         let id = match &mut self.backend {
             MemoryBackend::Agentic(db) => db
-                .store_episode(text.to_string(), vec![], vec![], text.to_string())
+                .store_episode(
+                    user_query.to_string(),
+                    vec![],
+                    vec![assistant_response.to_string()],
+                    user_query.to_string(), // critique — embedded field
+                )
                 .map_err(|e| AiAssistantError::Memory(e.to_string()))?,
             MemoryBackend::InMemory(episodes) => {
-                let embedding = precomputed_emb.unwrap_or_default();
                 let id = Uuid::new_v4().to_string();
                 episodes.push(InMemEpisode {
                     id: id.clone(),
-                    text: text.to_string(),
-                    embedding,
+                    // Store the full combined text for human-readable context,
+                    // but the embedding only covers user_query (see above).
+                    text: combined_text,
+                    embedding: embedding.clone(),
                     quality: quality_score,
                     timestamp: now,
                 });
                 id
             }
         };
+
+        // Sliding dedup window (FrameDeduplicator pattern).
+        if self.dedup_window.len() >= DEDUP_WINDOW_SIZE {
+            self.dedup_window.pop_front();
+        }
+        self.dedup_window.push_back(embedding);
 
         self.quality_map.insert(id.clone(), (quality_score, now));
         Ok(id)
@@ -349,38 +325,36 @@ impl MemoryStore {
     ) -> Result<Vec<Episode>, AiAssistantError> {
         let query_emb = self.embedding.embed(query_text)?;
 
+        // Log any incoherent memories detected by the sheaf graph.
+        let incoherent = self.coherence.find_incoherent_memories();
+        if !incoherent.is_empty() {
+            info!(count = incoherent.len(), "coherence: incoherent memories detected");
+        }
+
         let mut episodes: Vec<Episode> = match &self.backend {
             MemoryBackend::Agentic(db) => {
-                // Fetch more than top_k so we have headroom after similarity
-                // filtering (AgenticDB doesn't expose a score cut-off).
+                // Fetch more than top_k — AgenticDB has no score cut-off.
                 let fetch_k = (top_k * 3).max(top_k + 10);
                 let raw = db
                     .retrieve_similar_episodes(query_text, fetch_k)
                     .map_err(|e| AiAssistantError::Memory(e.to_string()))?;
 
-                let mut filtered: Vec<Episode> = raw
+                let filtered: Vec<Episode> = raw
                     .iter()
                     .filter_map(|ep| {
-                        // Score must meet the minimum threshold; episodes without
-                        // an embedding vector are silently skipped.
-                        if ep.embedding.is_empty() {
-                            return None;
-                        }
+                        if ep.embedding.is_empty() { return None; }
                         let sim = cosine_sim(&query_emb, &ep.embedding);
                         if sim < MIN_EPISODE_SIMILARITY {
-                            debug!(
+                            info!(
                                 episode_id = %ep.id,
-                                similarity = sim,
+                                similarity = format!("{:.4}", sim),
                                 threshold = MIN_EPISODE_SIMILARITY,
-                                "episode below similarity threshold — skipped"
+                                task_preview = %ep.task.chars().take(50).collect::<String>(),
+                                "episode rejected — below similarity threshold"
                             );
                             return None;
                         }
-                        let quality = self
-                            .quality_map
-                            .get(&ep.id)
-                            .map(|(q, _)| *q)
-                            .unwrap_or(1.0);
+                        let quality = self.quality_map.get(&ep.id).map(|(q, _)| *q).unwrap_or(1.0);
                         Some(reflexion_to_episode(ep, quality))
                     })
                     .take(top_k)
@@ -403,41 +377,31 @@ impl MemoryStore {
                     .filter_map(|ep| {
                         let sim = cosine_sim(&query_emb, &ep.embedding);
                         if sim < MIN_EPISODE_SIMILARITY {
-                            debug!(
+                            info!(
                                 episode_id = %ep.id,
-                                similarity = sim,
+                                similarity = format!("{:.4}", sim),
                                 threshold = MIN_EPISODE_SIMILARITY,
-                                "episode below similarity threshold — skipped"
+                                text_preview = %ep.text.chars().take(50).collect::<String>(),
+                                "episode rejected — below similarity threshold"
                             );
                             return None;
                         }
-                        let age = ep
-                            .timestamp
-                            .elapsed()
-                            .unwrap_or_default()
-                            .as_secs();
+                        let age = ep.timestamp.elapsed().unwrap_or_default().as_secs();
                         let tier = Self::get_tier(age);
-                        Some((
-                            sim,
-                            Episode {
-                                id: ep.id.clone(),
-                                text: ep.text.clone(),
-                                embedding: ep.embedding.clone(),
-                                timestamp: ep.timestamp,
-                                tier,
-                                quality_score: ep.quality,
-                            },
-                        ))
+                        Some((sim, Episode {
+                            id: ep.id.clone(),
+                            text: ep.text.clone(),
+                            embedding: ep.embedding.clone(),
+                            timestamp: ep.timestamp,
+                            tier,
+                            quality_score: ep.quality,
+                        }))
                     })
                     .collect();
 
-                scored.sort_by(|a, b| {
-                    b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
-                });
+                scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-                let total = episodes.len();
-                let kept = scored.len().min(top_k);
-                let rejected = total.saturating_sub(scored.len());
+                let rejected = episodes.len().saturating_sub(scored.len());
                 if rejected > 0 {
                     info!(
                         rejected,
@@ -446,24 +410,17 @@ impl MemoryStore {
                         rejected
                     );
                 }
-
-                scored
-                    .into_iter()
-                    .take(top_k)
-                    .map(|(_, ep)| ep)
-                    .collect()
+                scored.into_iter().take(top_k).map(|(_, ep)| ep).collect()
             }
         };
 
-        // Apply temporal compression to embeddings based on tier.
+        // Apply temporal compression (8/5/3-bit tiered quantization).
         for ep in &mut episodes {
-            ep.embedding =
-                apply_temporal_compression(&ep.embedding, &ep.tier);
+            ep.embedding = apply_temporal_compression(&ep.embedding, &ep.tier);
         }
 
         // Re-rank using Optimal Transport (fallback: preserve cosine order).
         episodes = rank_by_ot(&query_emb, episodes);
-
         Ok(episodes)
     }
 
@@ -498,7 +455,6 @@ impl MemoryStore {
         effect: &str,
     ) -> Result<(), AiAssistantError> {
         self.causal_cache.push((cause.to_string(), effect.to_string()));
-
         if let MemoryBackend::Agentic(db) = &self.backend {
             db.add_causal_edge(
                 vec![cause.to_string()],
@@ -517,7 +473,7 @@ impl MemoryStore {
         topic: &str,
     ) -> Result<Vec<(String, String)>, AiAssistantError> {
         let topic_lower = topic.to_lowercase();
-        let results = self
+        Ok(self
             .causal_cache
             .iter()
             .filter(|(c, e)| {
@@ -525,8 +481,7 @@ impl MemoryStore {
                     || e.to_lowercase().contains(&topic_lower)
             })
             .cloned()
-            .collect();
-        Ok(results)
+            .collect())
     }
 
     // ── Consolidation ─────────────────────────────────────────────────────────
@@ -534,21 +489,17 @@ impl MemoryStore {
     /// Drop episodes with `quality_score < 0.3`. Returns count removed.
     pub fn auto_consolidate(&mut self) -> Result<usize, AiAssistantError> {
         const LOW_QUALITY: f32 = 0.3;
-
         let low_ids: Vec<String> = self
             .quality_map
             .iter()
             .filter(|(_, (q, _))| *q < LOW_QUALITY)
             .map(|(id, _)| id.clone())
             .collect();
-
         let count = low_ids.len();
-
         for id in &low_ids {
             self.quality_map.remove(id);
             match &mut self.backend {
                 MemoryBackend::Agentic(db) => {
-                    // Delete the reflexion vector entry from VectorDB.
                     let vector_id = format!("reflexion_{}", id);
                     if let Err(e) = db.delete(&vector_id) {
                         warn!("auto_consolidate: delete {} failed: {}", vector_id, e);
@@ -559,11 +510,26 @@ impl MemoryStore {
                 }
             }
         }
-
         if count > 0 {
             info!("auto_consolidate: removed {} low-quality episodes", count);
         }
         Ok(count)
+    }
+
+    // ── Near-duplicate check ──────────────────────────────────────────────────
+
+    /// Return `true` when any stored episode's cosine similarity exceeds `threshold`.
+    ///
+    /// O(window_size) scan of `dedup_window` (≤ 50 entries) — no DB query.
+    pub fn is_near_duplicate(&self, text: &str, threshold: f32) -> bool {
+        if self.dedup_window.is_empty() { return false; }
+        match self.embedding.embed(text) {
+            Ok(query_emb) => self
+                .dedup_window
+                .iter()
+                .any(|stored| cosine_sim(&query_emb, stored) > threshold),
+            Err(_) => false,
+        }
     }
 
     // ── Semantic context ──────────────────────────────────────────────────────
@@ -579,45 +545,33 @@ impl MemoryStore {
     }
 }
 
-// ── Private helpers ───────────────────────────────────────────────────────────
+// ── Private functions ─────────────────────────────────────────────────────────
 
 /// Apply tiered quantization-compression to an embedding.
 ///
 /// Hot → 8-bit, Warm → 5-bit (via TierPolicy), Cold → 3-bit.
 /// Returns uncompressed original if compression fails.
 fn apply_temporal_compression(embedding: &[f32], tier: &EpisodeTier) -> Vec<f32> {
-    let access_count: u64 = match tier {
+    let access_count: u32 = match tier {
         EpisodeTier::Hot => 100,
         EpisodeTier::Warm => 10,
         EpisodeTier::Cold => 1,
     };
-
     let dim = embedding.len();
-    if dim == 0 {
-        return embedding.to_vec();
-    }
-
-    let mut comp = TemporalTensorCompressor::new(
-        TierPolicy::default(),
-        dim as u32,
-        0u32,
-    );
-    comp.set_access(access_count as u32, 0u32);
-
+    if dim == 0 { return embedding.to_vec(); }
+    let mut comp = TemporalTensorCompressor::new(TierPolicy::default(), dim as u32, 0u32);
+    comp.set_access(access_count, 0u32);
     let mut seg: Vec<u8> = Vec::new();
     comp.push_frame(embedding, 0, &mut seg);
     comp.flush(&mut seg);
-
     let mut decoded: Vec<f32> = Vec::new();
     tt_segment::decode(&seg, &mut decoded);
-
     if decoded.len() == dim {
         decoded
     } else {
         warn!(
             "Temporal compression produced wrong dim ({} vs {}); using original",
-            decoded.len(),
-            dim
+            decoded.len(), dim
         );
         embedding.to_vec()
     }
@@ -625,49 +579,32 @@ fn apply_temporal_compression(embedding: &[f32], tier: &EpisodeTier) -> Vec<f32>
 
 /// Rank `episodes` by Sliced Wasserstein distance to `query_emb`.
 ///
-/// Treats each embedding as a 1D empirical distribution (one point per
-/// dimension). Lower distance = more similar → appears earlier.
-/// Falls back to original order if OT returns NaN/Inf.
+/// Treats each embedding as a 1D empirical distribution. Lower distance = more
+/// similar → appears earlier. Falls back to original order on NaN/Inf.
 fn rank_by_ot(query_emb: &[f32], mut episodes: Vec<Episode>) -> Vec<Episode> {
-    if episodes.is_empty() || query_emb.is_empty() {
-        return episodes;
-    }
-
+    if episodes.is_empty() || query_emb.is_empty() { return episodes; }
     let sw = SlicedWasserstein::new(50).with_seed(42);
-    // OT distance method uses f64 — convert query embedding once
     let query_pts: Vec<Vec<f64>> = query_emb.iter().map(|&v| vec![v as f64]).collect();
-
     let mut scored: Vec<(f64, Episode)> = episodes
         .drain(..)
         .map(|ep| {
             let ep_pts: Vec<Vec<f64>> = ep.embedding.iter().map(|&v| vec![v as f64]).collect();
-            let dist = sw.distance(&query_pts, &ep_pts);
-            (dist, ep)
+            (sw.distance(&query_pts, &ep_pts), ep)
         })
         .collect();
-
-    // Check for NaN/Inf — if any, fall back to original (insertion) order.
-    let any_bad = scored.iter().any(|(d, _): &(f64, Episode)| !d.is_finite());
-    if any_bad {
+    if scored.iter().any(|(d, _)| !d.is_finite()) {
         warn!("OT ranking produced non-finite distances; preserving retrieval order");
         return scored.into_iter().map(|(_, ep)| ep).collect();
     }
-
     scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     scored.into_iter().map(|(_, ep)| ep).collect()
 }
 
 /// L2-normalised cosine similarity in [−1, 1].
 fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() {
-        return 0.0;
-    }
+    if a.len() != b.len() || a.is_empty() { return 0.0; }
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if na < 1e-8 || nb < 1e-8 {
-        0.0
-    } else {
-        dot / (na * nb)
-    }
+    if na < 1e-8 || nb < 1e-8 { 0.0 } else { dot / (na * nb) }
 }

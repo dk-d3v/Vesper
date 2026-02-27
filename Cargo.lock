@@ -44,13 +44,13 @@ dependencies = [
  "prime-radiant",
  "reqwest",
  "ruvector-cognitive-container",
- "ruvector-core",
+ "ruvector-core 2.0.4",
  "ruvector-dag",
  "ruvector-graph",
  "ruvector-math",
  "ruvector-mincut",
  "ruvector-solver",
- "ruvector-sona",
+ "ruvector-sona 0.1.6",
  "ruvector-temporal-tensor",
  "ruvector-verified",
  "rvf-crypto",
@@ -184,6 +184,17 @@ dependencies = [
  "event-listener",
  "event-listener-strategy",
  "pin-project-lite",
+]
+
+[[package]]
+name = "async-trait"
+version = "0.1.89"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9035ad2d096bed7955a320ee7e2230574d28fd3c3a0f186cbea1ff3c7eed5dbb"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -712,6 +723,27 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer",
  "crypto-common",
+]
+
+[[package]]
+name = "dirs"
+version = "5.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "44c45a9d03d6676652bcb5e724c7e988de1acad23a711b5217ab9cbecbec2225"
+dependencies = [
+ "dirs-sys",
+]
+
+[[package]]
+name = "dirs-sys"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "520f05a5cbd335fae5a99ff7a6ab8627577660ee5cfd6a94a6a929b52ff0321c"
+dependencies = [
+ "libc",
+ "option-ext",
+ "redox_users",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -1658,6 +1690,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "md5"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "490cc448043f947bae3cbee9c203358d62dbee0db12107a74be5c30ccfd09771"
+
+[[package]]
 name = "memchr"
 version = "2.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2041,6 +2079,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "option-ext"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
+
+[[package]]
 name = "ordered-float"
 version = "4.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2245,7 +2289,8 @@ dependencies = [
  "parking_lot",
  "rand 0.8.5",
  "rand_distr",
- "ruvector-core",
+ "ruvector-core 2.0.4",
+ "ruvllm",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -2437,6 +2482,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6d94dd2f7cd932d4dc02cc8b2b50dfd38bd079a4e5d79198b99743d7fcf9a4b4"
 dependencies = [
  "bitflags 2.11.0",
+]
+
+[[package]]
+name = "redox_users"
+version = "0.4.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba009ff324d1fc1b900bd1fdb31564febe58a8ccc8a6fdbb93b543d33b13ca43"
+dependencies = [
+ "getrandom 0.2.17",
+ "libredox",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -2709,6 +2765,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruvector-core"
+version = "2.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc7bc95e3682430c27228d7bc694ba9640cd322dde1bd5e7c9cf96a16afb4ca1"
+dependencies = [
+ "anyhow",
+ "bincode 2.0.1",
+ "chrono",
+ "crossbeam",
+ "dashmap 6.1.0",
+ "hnsw_rs",
+ "memmap2",
+ "ndarray 0.16.1",
+ "once_cell",
+ "parking_lot",
+ "rand 0.8.5",
+ "rand_distr",
+ "rayon",
+ "redb",
+ "rkyv",
+ "serde",
+ "serde_json",
+ "simsimd",
+ "thiserror 2.0.18",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "ruvector-dag"
 version = "2.0.4"
 dependencies = [
@@ -2718,7 +2803,7 @@ dependencies = [
  "ndarray 0.15.6",
  "parking_lot",
  "rand 0.8.5",
- "ruvector-core",
+ "ruvector-core 2.0.4",
  "serde",
  "serde_json",
  "sha2",
@@ -2758,7 +2843,7 @@ dependencies = [
  "redb",
  "rkyv",
  "roaring",
- "ruvector-core",
+ "ruvector-core 2.0.4",
  "serde",
  "serde_json",
  "simsimd",
@@ -2792,7 +2877,7 @@ dependencies = [
  "rand 0.8.5",
  "rayon",
  "roaring",
- "ruvector-core",
+ "ruvector-core 2.0.4",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -2825,6 +2910,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruvector-sona"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "981e86a5d07c09782014eaa9db47b0b55e0a30900e05d8be04ce68e5cb3ea803"
+dependencies = [
+ "crossbeam",
+ "getrandom 0.2.17",
+ "parking_lot",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ruvector-temporal-tensor"
 version = "2.0.4"
 
@@ -2834,6 +2933,39 @@ version = "0.1.1"
 dependencies = [
  "lean-agentic",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "ruvllm"
+version = "2.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "66cfdb19d6c71880ae57f96f1d0cdc21bba93ca4719aff58191b9875b86054aa"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bincode 2.0.1",
+ "chrono",
+ "dashmap 6.1.0",
+ "dirs",
+ "futures-core",
+ "half",
+ "md5",
+ "ndarray 0.16.1",
+ "once_cell",
+ "parking_lot",
+ "rand 0.8.5",
+ "regex",
+ "ruvector-core 2.0.5",
+ "ruvector-sona 0.1.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "serde",
+ "serde_json",
+ "sha2",
+ "smallvec",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -3413,6 +3545,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c28327cf380ac148141087fbfb9de9d7bd4e84ab5d2c28fbc911d753de8a7081"
 dependencies = [
  "rustls 0.21.12",
+ "tokio",
+]
+
+[[package]]
+name = "tokio-stream"
+version = "0.1.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32da49809aab5c3bc678af03902d4ccddea2a87d028d86392a4b1560c6906c70"
+dependencies = [
+ "futures-core",
+ "pin-project-lite",
  "tokio",
 ]
 

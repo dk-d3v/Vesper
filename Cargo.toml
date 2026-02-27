@@ -16,7 +16,7 @@ ruvector-core                = { path = "./ruvector/crates/ruvector-core" }
 ruvector-dag                 = { path = "./ruvector/crates/ruvector-dag" }
 ruvector-sona                = { path = "./ruvector/crates/sona" }
 ruvector-graph               = { path = "./ruvector/crates/ruvector-graph" }
-prime-radiant                = { path = "./ruvector/crates/prime-radiant" }
+prime-radiant                = { path = "./ruvector/crates/prime-radiant", features = ["ruvllm"] }
 ruvector-verified            = { path = "./ruvector/crates/ruvector-verified" }
 ruvector-cognitive-container = { path = "./ruvector/crates/ruvector-cognitive-container" }
 ruvector-math                = { path = "./ruvector/crates/ruvector-math" }
